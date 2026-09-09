@@ -606,7 +606,7 @@ uint8_t read_pty(char* pty_buffer){
 
 /* ── Renderer ───────────────────────────────────────────────────────────── */
 
-void render(SDL_Renderer* renderer, SDL_Texture* text_texture, TTF_Font* font,
+void render(SDL_Renderer* renderer, SDL_Texture* text_texture, TTF_Font* font, TTF_Font* font_bold, 
             uint32_t char_h, uint32_t char_w){
 
     (void)text_texture; /* reserved for future glyph-atlas optimisation */
@@ -641,14 +641,14 @@ void render(SDL_Renderer* renderer, SDL_Texture* text_texture, TTF_Font* font,
             if (cell.bold && fg_idx < 8) fg_idx += 8;
             SDL_Color fg_col = (fg_idx == ATTR_DEFAULT_FG || fg_idx >= 16) ? default_fg : ansi_palette[fg_idx];
 
-            SDL_Surface *surf = TTF_RenderUTF8_Blended(font, glyph, fg_col);
+            SDL_Surface *surf = TTF_RenderUTF8_Blended(cell.bold ? font_bold : font, glyph, fg_col);
             if (surf) {
                 SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, surf);
                 if (tex) {
                     SDL_Rect dst = {
                         cell_rect.x,
                         cell_rect.y,
-                        surf->w,
+                        surf->w > (int)char_w ? (int)char_w : surf->w,
                         surf->h
                     };
                     SDL_RenderCopy(renderer, tex, NULL, &dst);
@@ -686,17 +686,21 @@ int main(void) {
         SDL_Quit();
         return 1;
     }
-    TTF_Font *font = TTF_OpenFont("/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf", 32);
-    if (!font) {
-        font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 16);
+    TTF_Font*    font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 22);
+    TTF_Font*    font_bold = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 22);
+    if (!font || !font_bold) {
+        if (font) TTF_CloseFont(font);
+        if (font_bold) TTF_CloseFont(font_bold);
+        font = TTF_OpenFont("/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf", 32);
+        font_bold = TTF_OpenFont("/usr/share/fonts/truetype/ubuntu/UbuntuMono-B.ttf", 32);
     }
-    if (!font) {
-        fprintf(stderr, "Could not open monospace font: %s\n", TTF_GetError());
+    if (!font || !font_bold) {
+        fprintf(stderr, "Could not open monospace font or bold font: %s\n", TTF_GetError());
         TTF_Quit();
         SDL_Quit();
         return 1;
     }
-
+    TTF_SetFontStyle(font_bold, TTF_STYLE_BOLD);
     /* char_w/char_h are globals — assign them here after font load */
     TTF_SizeText(font, "M", &char_w, &char_h);
     if (char_w <= 0 || char_h <= 0) {
@@ -777,7 +781,7 @@ int main(void) {
             if(!read_pty(pty_buffer)) break;
         }
         if(needs_render){
-            render(renderer, text_texture, font, (uint32_t)char_h, (uint32_t)char_w);
+            render(renderer, text_texture, font, font_bold, (uint32_t)char_h, (uint32_t)char_w);
         }
     }
 
@@ -790,6 +794,7 @@ int main(void) {
     free(term_buffer);
     if (text_texture) SDL_DestroyTexture(text_texture);
     TTF_CloseFont(font);
+    TTF_CloseFont(font_bold);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     TTF_Quit();
