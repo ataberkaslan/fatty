@@ -25,9 +25,51 @@ uint8_t fullscreen = 0;
 /* Glyph cell size in pixels — set once after font load */
 static int char_w = 0, char_h = 0;
 
+#define ATTR_DEFAULT_FG 255
+#define ATTR_DEFAULT_BG 255
+
 typedef struct {
-    char c;
+    char    c;
+    uint8_t fg;    /* 0-15 or ATTR_DEFAULT_FG */
+    uint8_t bg;    /* 0-15 or ATTR_DEFAULT_BG */
+    uint8_t bold;  /* 1 if bold / high-intensity */
 } cell_t;
+
+static const SDL_Color default_bg   = {28, 28, 28, 255};
+static const SDL_Color default_fg   = {235, 219, 178, 255};
+static const SDL_Color cursor_color = {168, 153, 132, 255};
+
+static const SDL_Color ansi_palette[16] = {
+    {28, 28, 28, 255},     /* 0:  Black          */
+    {204, 36, 29, 255},    /* 1:  Red            */
+    {152, 151, 26, 255},   /* 2:  Green          */
+    {215, 153, 33, 255},   /* 3:  Yellow         */
+    {69, 133, 136, 255},   /* 4:  Blue           */
+    {177, 98, 134, 255},   /* 5:  Magenta        */
+    {104, 157, 106, 255},  /* 6:  Cyan           */
+    {168, 153, 132, 255},  /* 7:  White          */
+    {146, 131, 116, 255},  /* 8:  Bright Black   */
+    {251, 89, 68, 255},    /* 9:  Bright Red     */
+    {184, 187, 38, 255},   /* 10: Bright Green   */
+    {250, 189, 47, 255},   /* 11: Bright Yellow  */
+    {131, 165, 152, 255},  /* 12: Bright Blue    */
+    {211, 134, 155, 255},  /* 13: Bright Magenta */
+    {142, 192, 124, 255},  /* 14: Bright Cyan    */
+    {235, 219, 178, 255}   /* 15: Bright White   */
+};
+
+static uint8_t current_fg   = ATTR_DEFAULT_FG;
+static uint8_t current_bg   = ATTR_DEFAULT_BG;
+static uint8_t current_bold = 0;
+
+static inline cell_t make_blank_cell(void) {
+    cell_t cell;
+    cell.c    = 0;
+    cell.fg   = ATTR_DEFAULT_FG;
+    cell.bg   = ATTR_DEFAULT_BG;
+    cell.bold = 0;
+    return cell;
+}
 
 typedef struct {
     uint32_t x,y;
@@ -85,21 +127,24 @@ static void erase_line(int mode) {
     int end   = (mode == 0) ? cols : (int)cursor.x + 1;
     if (mode == 2) { start = 0; end = cols; }
     for (int i = start; i < end && i < cols; i++)
-        term_buffer[cursor.y * cols + i].c = 0;
+        term_buffer[cursor.y * cols + i] = make_blank_cell();
 }
 
 static void erase_display(int mode) {
     if (mode == 2) {
-        memset(term_buffer, 0, (size_t)cols * (size_t)rows * sizeof(cell_t));
+        for (size_t i = 0; i < (size_t)cols * (size_t)rows; i++)
+            term_buffer[i] = make_blank_cell();
     } else if (mode == 0) {
         /* cursor to end of screen */
         erase_line(0);
         for (int r = (int)cursor.y + 1; r < rows; r++)
-            memset(&term_buffer[r * cols], 0, (size_t)cols * sizeof(cell_t));
+            for (int c = 0; c < cols; c++)
+                term_buffer[r * cols + c] = make_blank_cell();
     } else if (mode == 1) {
         /* beginning of screen to cursor */
         for (int r = 0; r < (int)cursor.y; r++)
-            memset(&term_buffer[r * cols], 0, (size_t)cols * sizeof(cell_t));
+            for (int c = 0; c < cols; c++)
+                term_buffer[r * cols + c] = make_blank_cell();
         erase_line(1);
     }
 }
@@ -139,6 +184,72 @@ static void dispatch_osc(const char *buf) {
         SDL_SetWindowTitle(window, title);
     }
     /* OSC 1 (icon name) and all others are silently ignored */
+}
+
+/* Handle SGR (Select Graphic Rendition) attribute sequences. */
+static void handle_sgr(const char *params) {
+    if (!params || !*params) {
+        current_fg   = ATTR_DEFAULT_FG;
+        current_bg   = ATTR_DEFAULT_BG;
+        current_bold = 0;
+        return;
+    }
+    const char *p = params;
+    while (*p) {
+        while (*p && (*p < '0' || *p > '9')) p++;
+        if (!*p) break;
+        int code = atoi(p);
+        while (*p >= '0' && *p <= '9') p++;
+
+        if (code == 0) {
+            current_fg   = ATTR_DEFAULT_FG;
+            current_bg   = ATTR_DEFAULT_BG;
+            current_bold = 0;
+        } else if (code == 1) {
+            current_bold = 1;
+        } else if (code == 22) {
+            current_bold = 0;
+        } else if (code >= 30 && code <= 37) {
+            current_fg = (uint8_t)(code - 30);
+        } else if (code == 38) {
+            /* Extended foreground: 38;5;idx */
+            if (*p == ';') p++;
+            int type = atoi(p);
+            while (*p >= '0' && *p <= '9') p++;
+            if (type == 5) {
+                if (*p == ';') p++;
+                int col_idx = atoi(p);
+                while (*p >= '0' && *p <= '9') p++;
+                if (col_idx >= 0 && col_idx < 16) {
+                    current_fg = (uint8_t)col_idx;
+                }
+            }
+        } else if (code == 39) {
+            current_fg = ATTR_DEFAULT_FG;
+        } else if (code >= 40 && code <= 47) {
+            current_bg = (uint8_t)(code - 40);
+        } else if (code == 48) {
+            /* Extended background: 48;5;idx */
+            if (*p == ';') p++;
+            int type = atoi(p);
+            while (*p >= '0' && *p <= '9') p++;
+            if (type == 5) {
+                if (*p == ';') p++;
+                int col_idx = atoi(p);
+                while (*p >= '0' && *p <= '9') p++;
+                if (col_idx >= 0 && col_idx < 16) {
+                    current_bg = (uint8_t)col_idx;
+                }
+            }
+        } else if (code == 49) {
+            current_bg = ATTR_DEFAULT_BG;
+        } else if (code >= 90 && code <= 97) {
+            current_fg = (uint8_t)(8 + (code - 90));
+        } else if (code >= 100 && code <= 107) {
+            current_bg = (uint8_t)(8 + (code - 100));
+        }
+        if (*p == ';') p++;
+    }
 }
 
 /* Dispatch a completed CSI sequence.
@@ -201,8 +312,9 @@ static void dispatch_csi(const char *params, char final) {
         erase_line(p1);
         break;
 
-    /* ── Attributes / modes (ignored for now) ─────────────────── */
-    case 'm': /* SGR — colours & attributes, not yet rendered */
+    /* ── Attributes / modes ───────────────────────────────────── */
+    case 'm': /* SGR — colors & attributes */
+        handle_sgr(params);
         break;
     case 'h': /* Set mode / private mode on  */
     case 'l': /* Reset mode / private mode off */
@@ -225,8 +337,9 @@ static void scroll_up(void) {
     memmove(term_buffer,
             term_buffer + cols,
             (size_t)(rows - 1) * (size_t)cols * sizeof(cell_t));
-    memset(term_buffer + (rows - 1) * cols, 0,
-           (size_t)cols * sizeof(cell_t));
+    for (int i = 0; i < cols; i++) {
+        term_buffer[(rows - 1) * cols + i] = make_blank_cell();
+    }
 }
 
 /* Recompute grid dimensions from the new window pixel size, realloc the
@@ -240,6 +353,10 @@ static void resize_terminal(int new_w, int new_h) {
 
     cell_t *new_buf = calloc((size_t)new_cols * (size_t)new_rows, sizeof(cell_t));
     if (!new_buf) return; /* OOM — keep old buffer */
+
+    for (size_t i = 0; i < (size_t)new_cols * (size_t)new_rows; i++) {
+        new_buf[i] = make_blank_cell();
+    }
 
     /* Copy as much existing content as fits into the new grid */
     int copy_rows = rows < new_rows ? rows : new_rows;
@@ -332,9 +449,7 @@ void event_handler(){
             case SDLK_DELETE:    seq = "\x1b[3~"; break;
             case SDLK_PAGEUP:    seq = "\x1b[5~"; break;
             case SDLK_PAGEDOWN:  seq = "\x1b[6~"; break;
-            case SDLK_F11:
-                                fullscreen = !fullscreen; 
-                                 break;
+            case SDLK_F11:       fullscreen = !fullscreen; break;
             default: break;
             }
             if (seq) pty_write(seq, strlen(seq));
@@ -474,7 +589,12 @@ uint8_t read_pty(char* pty_buffer){
                 }
             }
             if ((int)cursor.y < rows) {
-                term_buffer[cursor.y * cols + cursor.x].c = (char)ch;
+                cell_t cell;
+                cell.c    = (char)ch;
+                cell.fg   = current_fg;
+                cell.bg   = current_bg;
+                cell.bold = current_bold;
+                term_buffer[cursor.y * cols + cursor.x] = cell;
                 cursor.x++;
             }
         }
@@ -492,24 +612,42 @@ void render(SDL_Renderer* renderer, SDL_Texture* text_texture, TTF_Font* font,
     (void)text_texture; /* reserved for future glyph-atlas optimisation */
 
     needs_render = 0;
-    SDL_Color fg_color = {212, 212, 212, 255}; /* #D4D4D4 */
-    SDL_SetRenderDrawColor(renderer, 30, 30, 30, 255);
+    SDL_SetRenderDrawColor(renderer, default_bg.r, default_bg.g, default_bg.b, default_bg.a);
     SDL_RenderClear(renderer);
 
     char glyph[2] = {0, 0};
 
     for (int r = 0; r < rows; r++) {
         for (int c = 0; c < cols; c++) {
-            char ch = term_buffer[r * cols + c].c;
-            if (ch <= ' ' || ch > 126) continue;
-            glyph[0] = ch;
-            SDL_Surface *surf = TTF_RenderUTF8_Blended(font, glyph, fg_color);
+            cell_t cell = term_buffer[r * cols + c];
+            SDL_Rect cell_rect = {
+                (int)(8 + c * char_w),
+                (int)(8 + r * char_h),
+                (int)char_w,
+                (int)char_h
+            };
+
+            /* Render cell background if not default */
+            if (cell.bg != ATTR_DEFAULT_BG && cell.bg < 16) {
+                SDL_Color bg_col = ansi_palette[cell.bg];
+                SDL_SetRenderDrawColor(renderer, bg_col.r, bg_col.g, bg_col.b, bg_col.a);
+                SDL_RenderFillRect(renderer, &cell_rect);
+            }
+
+            if (cell.c <= ' ' || cell.c > 126) continue;
+            glyph[0] = cell.c;
+
+            uint8_t fg_idx = cell.fg;
+            if (cell.bold && fg_idx < 8) fg_idx += 8;
+            SDL_Color fg_col = (fg_idx == ATTR_DEFAULT_FG || fg_idx >= 16) ? default_fg : ansi_palette[fg_idx];
+
+            SDL_Surface *surf = TTF_RenderUTF8_Blended(font, glyph, fg_col);
             if (surf) {
                 SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, surf);
                 if (tex) {
                     SDL_Rect dst = {
-                        (int)(8 + c * char_w),
-                        (int)(8 + r * char_h),
+                        cell_rect.x,
+                        cell_rect.y,
                         surf->w,
                         surf->h
                     };
@@ -523,7 +661,7 @@ void render(SDL_Renderer* renderer, SDL_Texture* text_texture, TTF_Font* font,
 
     /* Draw cursor block */
     if ((int)cursor.y < rows && (int)cursor.x < cols) {
-        SDL_SetRenderDrawColor(renderer, 212, 212, 212, 180);
+        SDL_SetRenderDrawColor(renderer, cursor_color.r, cursor_color.g, cursor_color.b, cursor_color.a);
         SDL_Rect cursor_rect = {
             (int)(8 + cursor.x * char_w),
             (int)(8 + cursor.y * char_h),
@@ -548,7 +686,7 @@ int main(void) {
         SDL_Quit();
         return 1;
     }
-    TTF_Font *font = TTF_OpenFont("/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf", 25);
+    TTF_Font *font = TTF_OpenFont("/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf", 32);
     if (!font) {
         font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 16);
     }
@@ -580,6 +718,9 @@ int main(void) {
         return 1;
     }
     term_buffer = calloc((size_t)cols * (size_t)rows, sizeof(cell_t));
+    for (size_t i = 0; i < (size_t)cols * (size_t)rows; i++) {
+        term_buffer[i] = make_blank_cell();
+    }
     SDL_Texture *text_texture = NULL;
 
     SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
