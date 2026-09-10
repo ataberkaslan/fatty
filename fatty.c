@@ -177,9 +177,9 @@ static void dispatch_osc(const char *buf) {
 
         char title[560];
         if (ci > 0) {
-            snprintf(title, sizeof(title), "f4tty - %s", clean);
+            snprintf(title, sizeof(title), "fatty - %s", clean);
         } else {
-            snprintf(title, sizeof(title), "f4tty");
+            snprintf(title, sizeof(title), "fatty");
         }
         SDL_SetWindowTitle(window, title);
     }
@@ -712,7 +712,7 @@ int main(void) {
     int win_height = char_h * rows + 16;
 
     window = SDL_CreateWindow(
-            "f4tty",
+            "fatty",
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
             win_width, win_height,
             SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE

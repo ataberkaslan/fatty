@@ -1,4 +1,4 @@
-# f4tty
+# fatty
 
 A lightweight, SDL2-based terminal emulator written in C.
 
@@ -41,7 +41,7 @@ To run:
 ```bash
 make run
 # or directly:
-./f4tty
+./fatty
 ```
 
 To clean build artifacts:

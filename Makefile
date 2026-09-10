@@ -4,8 +4,8 @@ CFLAGS   := -Wall -Wextra -O2 $(shell pkg-config --cflags sdl2 SDL2_ttf)
 LDFLAGS  := $(shell pkg-config --libs sdl2 SDL2_ttf) -lutil
 
 # Target and Sources
-TARGET   := f4tty 
-SRCS     := f4tty.c
+TARGET   := fatty 
+SRCS     := fatty.c
 OBJS     := $(SRCS:.c=.o)
 
 .PHONY: all clean run
