@@ -1,2 +1,5 @@
 *.o
 fatty
+test_codepoints.sh
+test_*.sh
+tests/
