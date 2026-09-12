@@ -41,14 +41,6 @@ static void clear_glyph_cache(void);
 #define ATTR_DEFAULT_FG 255
 #define ATTR_DEFAULT_BG 255
 
-typedef struct {
-    uint32_t codepoint; /* Unicode codepoint (U+0000 .. U+10FFFF) */
-    uint8_t  fg;        /* 0-15 or ATTR_DEFAULT_FG */
-    uint8_t  bg;        /* 0-15 or ATTR_DEFAULT_BG */
-    uint8_t  bold;      /* 1 if bold / high-intensity */
-    uint8_t  width;     /* 1 for standard, 2 for wide lead, 0 for wide continuation */
-} cell_t;
-
 static const SDL_Color default_bg   = {28, 28, 28, 255};
 static const SDL_Color default_fg   = {235, 219, 178, 255};
 static const SDL_Color cursor_color = {168, 153, 132, 255};
@@ -72,18 +64,82 @@ static const SDL_Color ansi_palette[16] = {
     {235, 219, 178, 255}   /* 15: Bright White   */
 };
 
-static uint8_t current_fg   = ATTR_DEFAULT_FG;
-static uint8_t current_bg   = ATTR_DEFAULT_BG;
-static uint8_t current_bold = 0;
+typedef struct {
+    uint32_t  codepoint;    /* Unicode codepoint (U+0000 .. U+10FFFF) */
+    SDL_Color fg;           /* Resolved text foreground color */
+    SDL_Color bg;           /* Resolved background color */
+    uint8_t   bold          : 1;
+    uint8_t   dim           : 1;
+    uint8_t   underline     : 1;
+    uint8_t   reverse       : 1;
+    uint8_t   is_default_fg : 1;
+    uint8_t   is_default_bg : 1;
+    uint8_t   width;        /* 1 for standard, 2 for wide lead, 0 for wide continuation */
+} cell_t;
+
+static SDL_Color current_fg;
+static SDL_Color current_bg;
+static uint8_t   current_bold = 0;
+static uint8_t   current_dim  = 0;
+static uint8_t   current_underline = 0;
+static uint8_t   current_reverse = 0;
+static uint8_t   current_is_default_fg = 1;
+static uint8_t   current_is_default_bg = 1;
+
+static void reset_sgr(void) {
+    current_fg = default_fg;
+    current_bg = default_bg;
+    current_bold = 0;
+    current_dim = 0;
+    current_underline = 0;
+    current_reverse = 0;
+    current_is_default_fg = 1;
+    current_is_default_bg = 1;
+}
 
 static inline cell_t make_blank_cell(void) {
     cell_t cell;
-    cell.codepoint = 0;
-    cell.fg        = ATTR_DEFAULT_FG;
-    cell.bg        = ATTR_DEFAULT_BG;
-    cell.bold      = 0;
-    cell.width     = 1;
+    memset(&cell, 0, sizeof(cell));
+    cell.codepoint     = 0;
+    cell.fg            = default_fg;
+    cell.bg            = default_bg;
+    cell.is_default_fg = 1;
+    cell.is_default_bg = 1;
+    cell.width         = 1;
     return cell;
+}
+
+static inline cell_t make_erased_cell(void) {
+    cell_t cell;
+    memset(&cell, 0, sizeof(cell));
+    cell.codepoint     = 0;
+    cell.fg            = current_fg;
+    cell.bg            = current_bg;
+    cell.is_default_fg = current_is_default_fg;
+    cell.is_default_bg = current_is_default_bg;
+    cell.width         = 1;
+    return cell;
+}
+
+static SDL_Color color_from_256(int idx) {
+    if (idx >= 0 && idx < 16) {
+        return ansi_palette[idx];
+    }
+    if (idx >= 16 && idx <= 231) {
+        int cube = idx - 16;
+        int r_idx = cube / 36;
+        int g_idx = (cube % 36) / 6;
+        int b_idx = cube % 6;
+        static const uint8_t cv[6] = {0, 95, 135, 175, 215, 255};
+        SDL_Color c = {cv[r_idx], cv[g_idx], cv[b_idx], 255};
+        return c;
+    }
+    if (idx >= 232 && idx <= 255) {
+        uint8_t v = (uint8_t)((idx - 232) * 10 + 8);
+        SDL_Color c = {v, v, v, 255};
+        return c;
+    }
+    return default_fg;
 }
 
 typedef struct {
@@ -126,7 +182,14 @@ typedef struct {
     int       rows;         /* Row count for this buffer */
     cursor_t  cursor;       /* Cursor position */
     uint8_t   wrap_next;    /* Pending wrap flag at margin */
-    cursor_t  saved_cursor; /* Saved cursor for ESC 7 / ESC 8 */
+    cursor_t  saved_cursor; /* Saved cursor for ESC 7 / ESC 8 / CSI ?1049 */
+    int       scroll_top;      /* 0-based top row of scrolling region (DECSTBM) */
+    int       scroll_bottom;   /* 0-based bottom row of scrolling region */
+    uint8_t   cursor_visible;  /* 1 = visible (DECTCEM), 0 = hidden */
+    uint8_t   auto_wrap;       /* 1 = DECAWM wrap at right margin */
+    uint8_t   app_cursor_keys; /* 1 = DECCKM application cursor keys */
+    uint8_t   mouse_tracking;  /* 0 = off, 1 = 1000, 2 = 1002, 3 = 1003 */
+    uint8_t   mouse_sgr;       /* 1 = 1006 SGR mouse mode */
 } screen_buffer_t;
 
 static screen_buffer_t screens[2];
@@ -143,18 +206,37 @@ static inline int get_status_bar_height(void) {
 static void resize_terminal(int new_w, int new_h);
 static void switch_buffer(buffer_type_t target);
 static void clear_scrollback();
+static void pty_write(const char *buf, size_t len);
 uint8_t running = 1, needs_render = 1;
 static int master_fd = -1;
+
+/* ── Text Selection & Clipboard ────────────────────────────────────────── */
+
+typedef struct {
+    int start_c, start_r;   /* Origin cell where mouse was pressed */
+    int end_c, end_r;       /* Target cell where mouse was dragged */
+    uint8_t active;         /* 1 if selection is currently active/highlighted */
+    uint8_t selecting;      /* 1 while left mouse button is pressed and dragging */
+    uint32_t last_click_time;
+    int click_count;        /* 1 = single/drag, 2 = double (word), 3 = triple (line) */
+} selection_t;
+
+static selection_t selection = {0, 0, 0, 0, 0, 0, 0, 0};
+static uint8_t bracketed_paste_mode = 0;
+static const SDL_Color selection_bg = {80, 73, 69, 255}; /* Gruvbox bg2 */
 
 /* ── ANSI parser ────────────────────────────────────────────────────────── */
 
 typedef enum {
     ANSI_NORMAL,    /* regular text                                    */
     ANSI_ESC,       /* received ESC (0x1B)                             */
+    ANSI_ESC_DROP,  /* eat 1 character after ESC (,),*,+, etc.         */
     ANSI_CSI,       /* received ESC [  — collecting params             */
     ANSI_OSC,       /* received ESC ]  — collecting OSC payload        */
     ANSI_OSC_ESC,   /* saw ESC inside OSC — peeking for ST (ESC \)     */
     ANSI_OSC_CSI,   /* skipping a CSI sequence embedded inside OSC     */
+    ANSI_DCS,       /* received ESC P  — absorbing DCS payload         */
+    ANSI_DCS_ESC,   /* saw ESC inside DCS — peeking for ST (ESC \)     */
 } ansi_state_t;
 
 static ansi_state_t ansi_state = ANSI_NORMAL;
@@ -183,12 +265,103 @@ static int parse_csi_params(const char *s, int *p1, int *p2, int def) {
     return count;
 }
 
+static inline int is_blank_cell(cell_t c) {
+    return (c.codepoint == 0 || c.codepoint == ' ') && c.is_default_bg && !c.reverse;
+}
+
+static void scrollback_push_row(const cell_t *row, int num_cols, uint8_t wrapped) {
+    scroll_row_t *slot = &scrollback[scrollback_head];
+    if (slot->cols != num_cols) {
+        free(slot->cells);
+        slot->cells = malloc((size_t)num_cols * sizeof(cell_t));
+        slot->cols  = num_cols;
+    }
+    slot->wrapped = wrapped;
+    if (slot->cells) {
+        memcpy(slot->cells, row, (size_t)num_cols * sizeof(cell_t));
+    }
+    scrollback_head = (scrollback_head + 1) % SCROLLBACK_MAX_LINES;
+    if (scrollback_count < SCROLLBACK_MAX_LINES) {
+        scrollback_count++;
+    }
+    if (scroll_offset > 0 && scroll_offset < scrollback_count) {
+        scroll_offset++;
+    }
+}
+
+static void clear_scrollback(void) {
+    for (int i = 0; i < SCROLLBACK_MAX_LINES; i++) {
+        if (scrollback[i].cells) {
+            free(scrollback[i].cells);
+            scrollback[i].cells = NULL;
+            scrollback[i].cols  = 0;
+            scrollback[i].wrapped = 0;
+        }
+    }
+    scrollback_head  = 0;
+    scrollback_count = 0;
+    scroll_offset    = 0;
+}
+
+static void scroll_region_up(int top, int bottom) {
+    if (top < 0) top = 0;
+    if (bottom >= rows) bottom = rows - 1;
+    if (top >= bottom) return;
+
+    /* Preserve top row in scrollback ring buffer (only for primary screen buffer and full-screen region) */
+    if (top == 0 && bottom == rows - 1 && has_status_bar()) {
+        scrollback_push_row(term_buffer, cols, row_wrapped ? row_wrapped[0] : 0);
+    }
+
+    memmove(term_buffer + top * cols,
+            term_buffer + (top + 1) * cols,
+            (size_t)(bottom - top) * (size_t)cols * sizeof(cell_t));
+    if (row_wrapped) {
+        memmove(row_wrapped + top,
+                row_wrapped + top + 1,
+                (size_t)(bottom - top) * sizeof(uint8_t));
+        row_wrapped[bottom] = 0;
+    }
+    for (int i = 0; i < cols; i++) {
+        term_buffer[bottom * cols + i] = make_blank_cell();
+    }
+}
+
+static void scroll_region_down(int top, int bottom) {
+    if (top < 0) top = 0;
+    if (bottom >= rows) bottom = rows - 1;
+    if (top >= bottom) return;
+
+    memmove(term_buffer + (top + 1) * cols,
+            term_buffer + top * cols,
+            (size_t)(bottom - top) * (size_t)cols * sizeof(cell_t));
+    if (row_wrapped) {
+        memmove(row_wrapped + top + 1,
+                row_wrapped + top,
+                (size_t)(bottom - top) * sizeof(uint8_t));
+        row_wrapped[top] = 0;
+    }
+    for (int i = 0; i < cols; i++) {
+        term_buffer[top * cols + i] = make_blank_cell();
+    }
+}
+
+static void scroll_up(void) {
+    int top = screens[active_buffer].scroll_top;
+    int bottom = screens[active_buffer].scroll_bottom;
+    if (bottom <= top || bottom >= rows) {
+        top = 0;
+        bottom = rows - 1;
+    }
+    scroll_region_up(top, bottom);
+}
+
 static void erase_line(int mode) {
     int start = (mode == 1) ? 0    : (int)cursor.x;
     int end   = (mode == 0) ? cols : (int)cursor.x + 1;
     if (mode == 2) { start = 0; end = cols; }
     for (int i = start; i < end && i < cols; i++)
-        term_buffer[cursor.y * cols + i] = make_blank_cell();
+        term_buffer[cursor.y * cols + i] = make_erased_cell();
     if (mode == 0 || mode == 2) {
         if (row_wrapped && (int)cursor.y < rows) {
             row_wrapped[cursor.y] = 0;
@@ -203,7 +376,7 @@ static void erase_display(int mode) {
         clear_scrollback();
     } else if (mode == 2) {
         for (size_t i = 0; i < (size_t)cols * (size_t)rows; i++)
-            term_buffer[i] = make_blank_cell();
+            term_buffer[i] = make_erased_cell();
         if (row_wrapped) {
             memset(row_wrapped, 0, (size_t)rows * sizeof(uint8_t));
         }
@@ -212,14 +385,14 @@ static void erase_display(int mode) {
         erase_line(0);
         for (int r = (int)cursor.y + 1; r < rows; r++) {
             for (int c = 0; c < cols; c++)
-                term_buffer[r * cols + c] = make_blank_cell();
+                term_buffer[r * cols + c] = make_erased_cell();
             if (row_wrapped) row_wrapped[r] = 0;
         }
     } else if (mode == 1) {
         /* beginning of screen to cursor */
         for (int r = 0; r < (int)cursor.y; r++) {
             for (int c = 0; c < cols; c++)
-                term_buffer[r * cols + c] = make_blank_cell();
+                term_buffer[r * cols + c] = make_erased_cell();
             if (row_wrapped) row_wrapped[r] = 0;
         }
         erase_line(1);
@@ -227,14 +400,7 @@ static void erase_display(int mode) {
     wrap_next = 0;
 }
 
-/* Handle a completed OSC (Operating System Command) sequence.
- * buf is the NUL-terminated content between ESC] and the terminator.
- * Format: Ps ; Pt   — Ps is numeric command, Pt is the payload string.
- *
- * OSC 0 : set icon name AND window title
- * OSC 1 : set icon name (ignored)
- * OSC 2 : set window title
- */
+/* Handle a completed OSC (Operating System Command) sequence. */
 static void dispatch_osc(const char *buf) {
     int ps = 0;
     const char *pt = buf;
@@ -260,37 +426,51 @@ static void dispatch_osc(const char *buf) {
             snprintf(title, sizeof(title), "fatty");
         }
         SDL_SetWindowTitle(window, title);
+    } else if (ps == 10 && *pt == '?') {
+        /* OSC 10: query foreground color */
+        pty_write("\x1b]10;rgb:eb/db/b2\x1b\\", 19);
+    } else if (ps == 11 && *pt == '?') {
+        /* OSC 11: query background color */
+        pty_write("\x1b]11;rgb:1c/1c/1c\x1b\\", 19);
     }
-    /* OSC 1 (icon name) and all others are silently ignored */
 }
 
-/* Handle SGR (Select Graphic Rendition) attribute sequences. */
+/* Handle SGR (Select Graphic Rendition) attribute sequences with TrueColor and 256 colors. */
 static void handle_sgr(const char *params) {
     if (!params || !*params) {
-        current_fg   = ATTR_DEFAULT_FG;
-        current_bg   = ATTR_DEFAULT_BG;
-        current_bold = 0;
+        reset_sgr();
         return;
     }
     const char *p = params;
     while (*p) {
-        while (*p && (*p < '0' || *p > '9')) p++;
+        while (*p && (*p < '0' || *p > '9') && *p != ';') p++;
         if (!*p) break;
+        if (*p == ';') { p++; continue; }
         int code = atoi(p);
         while (*p >= '0' && *p <= '9') p++;
 
         if (code == 0) {
-            current_fg   = ATTR_DEFAULT_FG;
-            current_bg   = ATTR_DEFAULT_BG;
-            current_bold = 0;
+            reset_sgr();
         } else if (code == 1) {
             current_bold = 1;
+        } else if (code == 2) {
+            current_dim = 1;
+        } else if (code == 4) {
+            current_underline = 1;
+        } else if (code == 7) {
+            current_reverse = 1;
         } else if (code == 22) {
             current_bold = 0;
+            current_dim = 0;
+        } else if (code == 24) {
+            current_underline = 0;
+        } else if (code == 27) {
+            current_reverse = 0;
         } else if (code >= 30 && code <= 37) {
-            current_fg = (uint8_t)(code - 30);
+            current_fg = ansi_palette[code - 30];
+            current_is_default_fg = 0;
         } else if (code == 38) {
-            /* Extended foreground: 38;5;idx */
+            /* Extended foreground: 38;5;idx OR 38;2;r;g;b */
             if (*p == ';') p++;
             int type = atoi(p);
             while (*p >= '0' && *p <= '9') p++;
@@ -298,16 +478,32 @@ static void handle_sgr(const char *params) {
                 if (*p == ';') p++;
                 int col_idx = atoi(p);
                 while (*p >= '0' && *p <= '9') p++;
-                if (col_idx >= 0 && col_idx < 16) {
-                    current_fg = (uint8_t)col_idx;
-                }
+                current_fg = color_from_256(col_idx);
+                current_is_default_fg = 0;
+            } else if (type == 2) {
+                if (*p == ';') p++;
+                int r = atoi(p);
+                while (*p >= '0' && *p <= '9') p++;
+                if (*p == ';') p++;
+                int g = atoi(p);
+                while (*p >= '0' && *p <= '9') p++;
+                if (*p == ';') p++;
+                int b = atoi(p);
+                while (*p >= '0' && *p <= '9') p++;
+                if (r < 0) { r = 0; } else if (r > 255) { r = 255; }
+                if (g < 0) { g = 0; } else if (g > 255) { g = 255; }
+                if (b < 0) { b = 0; } else if (b > 255) { b = 255; }
+                current_fg = (SDL_Color){(uint8_t)r, (uint8_t)g, (uint8_t)b, 255};
+                current_is_default_fg = 0;
             }
         } else if (code == 39) {
-            current_fg = ATTR_DEFAULT_FG;
+            current_fg = default_fg;
+            current_is_default_fg = 1;
         } else if (code >= 40 && code <= 47) {
-            current_bg = (uint8_t)(code - 40);
+            current_bg = ansi_palette[code - 40];
+            current_is_default_bg = 0;
         } else if (code == 48) {
-            /* Extended background: 48;5;idx */
+            /* Extended background: 48;5;idx OR 48;2;r;g;b */
             if (*p == ';') p++;
             int type = atoi(p);
             while (*p >= '0' && *p <= '9') p++;
@@ -315,19 +511,49 @@ static void handle_sgr(const char *params) {
                 if (*p == ';') p++;
                 int col_idx = atoi(p);
                 while (*p >= '0' && *p <= '9') p++;
-                if (col_idx >= 0 && col_idx < 16) {
-                    current_bg = (uint8_t)col_idx;
-                }
+                current_bg = color_from_256(col_idx);
+                current_is_default_bg = 0;
+            } else if (type == 2) {
+                if (*p == ';') p++;
+                int r = atoi(p);
+                while (*p >= '0' && *p <= '9') p++;
+                if (*p == ';') p++;
+                int g = atoi(p);
+                while (*p >= '0' && *p <= '9') p++;
+                if (*p == ';') p++;
+                int b = atoi(p);
+                while (*p >= '0' && *p <= '9') p++;
+                if (r < 0) { r = 0; } else if (r > 255) { r = 255; }
+                if (g < 0) { g = 0; } else if (g > 255) { g = 255; }
+                if (b < 0) { b = 0; } else if (b > 255) { b = 255; }
+                current_bg = (SDL_Color){(uint8_t)r, (uint8_t)g, (uint8_t)b, 255};
+                current_is_default_bg = 0;
             }
         } else if (code == 49) {
-            current_bg = ATTR_DEFAULT_BG;
+            current_bg = default_bg;
+            current_is_default_bg = 1;
         } else if (code >= 90 && code <= 97) {
-            current_fg = (uint8_t)(8 + (code - 90));
+            current_fg = ansi_palette[8 + (code - 90)];
+            current_is_default_fg = 0;
         } else if (code >= 100 && code <= 107) {
-            current_bg = (uint8_t)(8 + (code - 100));
+            current_bg = ansi_palette[8 + (code - 100)];
+            current_is_default_bg = 0;
         }
         if (*p == ';') p++;
     }
+}
+
+static int has_param(const char *params, int code) {
+    if (!params) return 0;
+    const char *p = params;
+    while (*p) {
+        while (*p && !(*p >= '0' && *p <= '9')) p++;
+        if (!*p) break;
+        int val = atoi(p);
+        if (val == code) return 1;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    return 0;
 }
 
 /* Dispatch a completed CSI sequence.
@@ -373,6 +599,7 @@ static void dispatch_csi(const char *params, char final) {
           cursor.y = (cursor.y >= (uint32_t)n) ? cursor.y - n : 0; }
         break;
     case 'G': /* Cursor Horizontal Absolute */
+    case '`': /* HPA */
         wrap_next = 0;
         { int col = p1 ? p1 - 1 : 0;
           cursor.x = col < cols ? (uint32_t)col : (uint32_t)(cols - 1); }
@@ -382,21 +609,154 @@ static void dispatch_csi(const char *params, char final) {
         wrap_next = 0;
         { int row = p1 ? p1 - 1 : 0;
           int col = p2 ? p2 - 1 : 0;
+          if (row < 0) row = 0;
+          if (col < 0) col = 0;
           cursor.y = row < rows ? (uint32_t)row : (uint32_t)(rows - 1);
           cursor.x = col < cols ? (uint32_t)col : (uint32_t)(cols - 1); }
         break;
     case 'd': /* Line Position Absolute (row, 1-based) */
         wrap_next = 0;
         { int row = p1 ? p1 - 1 : 0;
+          if (row < 0) row = 0;
           cursor.y = row < rows ? (uint32_t)row : (uint32_t)(rows - 1); }
         break;
+    case 'I': /* Cursor Forward Tab */
+        wrap_next = 0;
+        { int n = p1 ? p1 : 1;
+          for (int i = 0; i < n; i++) {
+              cursor.x = (cursor.x + 8) & ~7u;
+              if ((int)cursor.x >= cols) { cursor.x = (uint32_t)(cols - 1); break; }
+          }
+        }
+        break;
+    case 'Z': /* Cursor Backward Tab (CBT) */
+        wrap_next = 0;
+        { int n = p1 ? p1 : 1;
+          for (int i = 0; i < n && cursor.x > 0; i++) {
+              cursor.x = (cursor.x > 0) ? ((cursor.x - 1) & ~7u) : 0;
+          }
+        }
+        break;
 
-    /* ── Erase ────────────────────────────────────────────────── */
+    /* ── Erase & Edit ─────────────────────────────────────────── */
     case 'J': /* Erase in Display */
         erase_display(p1);
         break;
     case 'K': /* Erase in Line */
         erase_line(p1);
+        break;
+    case 'X': /* Erase Characters (ECH) */
+        {
+            int n = p1 ? p1 : 1;
+            int limit = (int)cursor.x + n;
+            if (limit > cols) limit = cols;
+            for (int i = (int)cursor.x; i < limit; i++) {
+                term_buffer[cursor.y * cols + i] = make_erased_cell();
+            }
+            wrap_next = 0;
+        }
+        break;
+    case '@': /* Insert Characters (ICH) */
+        {
+            int n = p1 ? p1 : 1;
+            if (n > cols - (int)cursor.x) n = cols - (int)cursor.x;
+            if (n > 0) {
+                int r = (int)cursor.y;
+                int c = (int)cursor.x;
+                int count = cols - c - n;
+                if (count > 0) {
+                    memmove(term_buffer + r * cols + c + n,
+                            term_buffer + r * cols + c,
+                            (size_t)count * sizeof(cell_t));
+                }
+                for (int i = 0; i < n; i++) {
+                    term_buffer[r * cols + c + i] = make_erased_cell();
+                }
+                wrap_next = 0;
+            }
+        }
+        break;
+    case 'P': /* Delete Characters (DCH) */
+        {
+            int n = p1 ? p1 : 1;
+            if (n > cols - (int)cursor.x) n = cols - (int)cursor.x;
+            if (n > 0) {
+                int r = (int)cursor.y;
+                int c = (int)cursor.x;
+                int count = cols - c - n;
+                if (count > 0) {
+                    memmove(term_buffer + r * cols + c,
+                            term_buffer + r * cols + c + n,
+                            (size_t)count * sizeof(cell_t));
+                }
+                for (int i = 0; i < n; i++) {
+                    term_buffer[r * cols + (cols - n + i)] = make_erased_cell();
+                }
+                wrap_next = 0;
+            }
+        }
+        break;
+    case 'L': /* Insert Line (IL) */
+        {
+            int n = p1 ? p1 : 1;
+            int r = (int)cursor.y;
+            int top = screens[active_buffer].scroll_top;
+            int bottom = screens[active_buffer].scroll_bottom;
+            if (r >= top && r <= bottom) {
+                for (int i = 0; i < n; i++) {
+                    if (bottom > r) {
+                        memmove(term_buffer + (r + 1) * cols,
+                                term_buffer + r * cols,
+                                (size_t)(bottom - r) * (size_t)cols * sizeof(cell_t));
+                    }
+                    for (int c = 0; c < cols; c++) {
+                        term_buffer[r * cols + c] = make_erased_cell();
+                    }
+                }
+                wrap_next = 0;
+            }
+        }
+        break;
+    case 'M': /* Delete Line (DL) */
+        {
+            int n = p1 ? p1 : 1;
+            int r = (int)cursor.y;
+            int top = screens[active_buffer].scroll_top;
+            int bottom = screens[active_buffer].scroll_bottom;
+            if (r >= top && r <= bottom) {
+                for (int i = 0; i < n; i++) {
+                    if (bottom > r) {
+                        memmove(term_buffer + r * cols,
+                                term_buffer + (r + 1) * cols,
+                                (size_t)(bottom - r) * (size_t)cols * sizeof(cell_t));
+                    }
+                    for (int c = 0; c < cols; c++) {
+                        term_buffer[bottom * cols + c] = make_erased_cell();
+                    }
+                }
+                wrap_next = 0;
+            }
+        }
+        break;
+    case 'S': /* Scroll Up (SU) */
+        {
+            int n = p1 ? p1 : 1;
+            int top = screens[active_buffer].scroll_top;
+            int bottom = screens[active_buffer].scroll_bottom;
+            for (int i = 0; i < n; i++) {
+                scroll_region_up(top, bottom);
+            }
+        }
+        break;
+    case 'T': /* Scroll Down (SD) */
+        {
+            int n = p1 ? p1 : 1;
+            int top = screens[active_buffer].scroll_top;
+            int bottom = screens[active_buffer].scroll_bottom;
+            for (int i = 0; i < n; i++) {
+                scroll_region_down(top, bottom);
+            }
+        }
         break;
 
     /* ── Attributes / modes ───────────────────────────────────── */
@@ -404,9 +764,12 @@ static void dispatch_csi(const char *params, char final) {
         handle_sgr(params);
         break;
     case 'h': /* Set mode / private mode on  */
-        if (params && (strstr(params, "?1049") || strstr(params, "?1047") || strstr(params, "?47"))) {
+        if (has_param(params, 1049)) {
+            screens[BUFFER_MAIN].saved_cursor = cursor;
+        }
+        if (has_param(params, 1049) || has_param(params, 1047) || has_param(params, 47)) {
             switch_buffer(BUFFER_ALT);
-            if (strstr(params, "1049")) {
+            if (has_param(params, 1049)) {
                 for (size_t i = 0; i < (size_t)cols * (size_t)rows; i++) {
                     term_buffer[i] = make_blank_cell();
                 }
@@ -414,13 +777,37 @@ static void dispatch_csi(const char *params, char final) {
                 cursor.x = 0;
                 cursor.y = 0;
                 wrap_next = 0;
+                screens[active_buffer].scroll_top = 0;
+                screens[active_buffer].scroll_bottom = rows - 1;
             }
         }
+        if (has_param(params, 2004)) bracketed_paste_mode = 1;
+        if (has_param(params, 25))   screens[active_buffer].cursor_visible = 1;
+        if (has_param(params, 1))    screens[active_buffer].app_cursor_keys = 1;
+        if (has_param(params, 7))    screens[active_buffer].auto_wrap = 1;
+        if (has_param(params, 1000)) screens[active_buffer].mouse_tracking = 1;
+        if (has_param(params, 1002)) screens[active_buffer].mouse_tracking = 2;
+        if (has_param(params, 1003)) screens[active_buffer].mouse_tracking = 3;
+        if (has_param(params, 1006)) screens[active_buffer].mouse_sgr = 1;
         break;
     case 'l': /* Reset mode / private mode off */
-        if (params && (strstr(params, "?1049") || strstr(params, "?1047") || strstr(params, "?47"))) {
+        if (has_param(params, 1049) || has_param(params, 1047) || has_param(params, 47)) {
             switch_buffer(BUFFER_MAIN);
+            if (has_param(params, 1049)) {
+                cursor = screens[BUFFER_MAIN].saved_cursor;
+                if ((int)cursor.x >= cols) cursor.x = (uint32_t)(cols - 1);
+                if ((int)cursor.y >= rows) cursor.y = (uint32_t)(rows - 1);
+                wrap_next = 0;
+            }
         }
+        if (has_param(params, 2004)) bracketed_paste_mode = 0;
+        if (has_param(params, 25))   screens[active_buffer].cursor_visible = 0;
+        if (has_param(params, 1))    screens[active_buffer].app_cursor_keys = 0;
+        if (has_param(params, 7))    screens[active_buffer].auto_wrap = 0;
+        if (has_param(params, 1000) || has_param(params, 1002) || has_param(params, 1003)) {
+            screens[active_buffer].mouse_tracking = 0;
+        }
+        if (has_param(params, 1006)) screens[active_buffer].mouse_sgr = 0;
         break;
     case 's': /* Save cursor position */
         screens[active_buffer].saved_cursor = cursor;
@@ -431,75 +818,46 @@ static void dispatch_csi(const char *params, char final) {
         if ((int)cursor.y >= rows) cursor.y = (uint32_t)(rows - 1);
         wrap_next = 0;
         break;
-    case 'r': /* DECSTBM — set scrolling region (ignored) */
+    case 'r': /* DECSTBM — set scrolling region */
+        {
+            int top = p1 ? p1 - 1 : 0;
+            int bottom = p2 ? p2 - 1 : rows - 1;
+            if (top < 0) top = 0;
+            if (bottom >= rows) bottom = rows - 1;
+            if (top < bottom) {
+                screens[active_buffer].scroll_top = top;
+                screens[active_buffer].scroll_bottom = bottom;
+            } else {
+                screens[active_buffer].scroll_top = 0;
+                screens[active_buffer].scroll_bottom = rows - 1;
+            }
+            cursor.x = 0;
+            cursor.y = 0;
+            wrap_next = 0;
+        }
         break;
     case 'n': /* Device Status Report */
+        if (p1 == 6) {
+            char cpr[32];
+            snprintf(cpr, sizeof(cpr), "\x1b[%d;%dR", (int)cursor.y + 1, (int)cursor.x + 1);
+            pty_write(cpr, strlen(cpr));
+        } else if (p1 == 5) {
+            pty_write("\x1b[0n", 4);
+        }
+        break;
+    case 'c': /* Device Attributes */
+        if (params && strchr(params, '>')) {
+            /* Secondary DA (DA2) */
+            pty_write("\x1b[>0;10;0c", 10);
+        } else {
+            /* Primary DA (DA1) */
+            pty_write("\x1b[?1;2c", 7);
+        }
         break;
 
     /* ── Everything else: silently consume ───────────────────── */
     default:
         break;
-    }
-}
-
-/* ── Scroll & resize ────────────────────────────────────────────────────── */
-
-static inline int is_blank_cell(cell_t c) {
-    return (c.codepoint == 0 || c.codepoint == ' ') && c.bg == ATTR_DEFAULT_BG;
-}
-
-static void scrollback_push_row(const cell_t *row, int num_cols, uint8_t wrapped) {
-    scroll_row_t *slot = &scrollback[scrollback_head];
-    if (slot->cols != num_cols) {
-        free(slot->cells);
-        slot->cells = malloc((size_t)num_cols * sizeof(cell_t));
-        slot->cols  = num_cols;
-    }
-    slot->wrapped = wrapped;
-    if (slot->cells) {
-        memcpy(slot->cells, row, (size_t)num_cols * sizeof(cell_t));
-    }
-    scrollback_head = (scrollback_head + 1) % SCROLLBACK_MAX_LINES;
-    if (scrollback_count < SCROLLBACK_MAX_LINES) {
-        scrollback_count++;
-    }
-    if (scroll_offset > 0 && scroll_offset < scrollback_count) {
-        scroll_offset++;
-    }
-}
-
-static void clear_scrollback(void) {
-    for (int i = 0; i < SCROLLBACK_MAX_LINES; i++) {
-        if (scrollback[i].cells) {
-            free(scrollback[i].cells);
-            scrollback[i].cells = NULL;
-            scrollback[i].cols  = 0;
-            scrollback[i].wrapped = 0;
-        }
-    }
-    scrollback_head  = 0;
-    scrollback_count = 0;
-    scroll_offset    = 0;
-}
-
-/* Shift the entire screen up by one row, clearing the bottom line. */
-static void scroll_up(void) {
-    /* Preserve top row in scrollback ring buffer (only for primary screen buffer) */
-    if (has_status_bar()) {
-        scrollback_push_row(term_buffer, cols, row_wrapped ? row_wrapped[0] : 0);
-    }
-
-    memmove(term_buffer,
-            term_buffer + cols,
-            (size_t)(rows - 1) * (size_t)cols * sizeof(cell_t));
-    if (row_wrapped) {
-        memmove(row_wrapped,
-                row_wrapped + 1,
-                (size_t)(rows - 1) * sizeof(uint8_t));
-        row_wrapped[rows - 1] = 0;
-    }
-    for (int i = 0; i < cols; i++) {
-        term_buffer[(rows - 1) * cols + i] = make_blank_cell();
     }
 }
 
@@ -529,9 +887,195 @@ static cell_t get_visible_cell(int r, int c) {
     }
 }
 
+/* ── Selection & Clipboard Operations ──────────────────────────────────── */
+
+static int utf8_encode(uint32_t cp, char *out) {
+    if (cp <= 0x7F) {
+        out[0] = (char)cp;
+        return 1;
+    } else if (cp <= 0x7FF) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    } else if (cp <= 0xFFFF) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    } else if (cp <= 0x10FFFF) {
+        out[0] = (char)(0xF0 | (cp >> 18));
+        out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[3] = (char)(0x80 | (cp & 0x3F));
+        return 4;
+    }
+    return 0;
+}
+
+static void pixel_to_cell(int px, int py, int *out_c, int *out_r) {
+    if (char_w == 0 || char_h == 0) {
+        *out_c = 0;
+        *out_r = 0;
+        return;
+    }
+    int max_py = win_height - get_status_bar_height();
+    if (py >= max_py) py = max_py - 1;
+    if (py < 8) py = 8;
+    if (px < 8) px = 8;
+    int max_px = 8 + cols * (int)char_w;
+    if (px >= max_px) px = max_px - 1;
+
+    int c = (px - 8) / (int)char_w;
+    int r = (py - 8) / (int)char_h;
+    if (c < 0) c = 0;
+    if (c >= cols) c = cols - 1;
+    if (r < 0) r = 0;
+    if (r >= rows) r = rows - 1;
+
+    *out_c = c;
+    *out_r = r;
+}
+
+static void normalize_selection(int *out_r1, int *out_c1, int *out_r2, int *out_c2) {
+    if (selection.start_r < selection.end_r ||
+       (selection.start_r == selection.end_r && selection.start_c <= selection.end_c)) {
+        *out_r1 = selection.start_r; *out_c1 = selection.start_c;
+        *out_r2 = selection.end_r;   *out_c2 = selection.end_c;
+    } else {
+        *out_r1 = selection.end_r;   *out_c1 = selection.end_c;
+        *out_r2 = selection.start_r; *out_c2 = selection.start_c;
+    }
+}
+
+static int is_cell_selected(int r, int c) {
+    if (!selection.active) return 0;
+    int r1, c1, r2, c2;
+    normalize_selection(&r1, &c1, &r2, &c2);
+    if (r < r1 || r > r2) return 0;
+    if (r == r1 && r == r2) return (c >= c1 && c <= c2);
+    if (r == r1) return (c >= c1);
+    if (r == r2) return (c <= c2);
+    return 1;
+}
+
+static int is_word_char(uint32_t cp) {
+    if (cp == 0 || cp == ' ' || cp == '\t') return 0;
+    if (cp == '"' || cp == '\'' || cp == '`' || cp == '(' || cp == ')' ||
+        cp == '[' || cp == ']'  || cp == '{' || cp == '}' || cp == '<' ||
+        cp == '>' || cp == ';'  || cp == ',') {
+        return 0;
+    }
+    return 1;
+}
+
+static void select_word_at(int c, int r) {
+    cell_t cell = get_visible_cell(r, c);
+    int is_word = is_word_char(cell.codepoint);
+
+    int start_c = c;
+    while (start_c > 0) {
+        cell_t prev = get_visible_cell(r, start_c - 1);
+        if (is_word_char(prev.codepoint) != is_word) break;
+        start_c--;
+    }
+
+    int end_c = c;
+    while (end_c < cols - 1) {
+        cell_t next = get_visible_cell(r, end_c + 1);
+        if (is_word_char(next.codepoint) != is_word) break;
+        end_c++;
+    }
+
+    selection.start_c = start_c;
+    selection.start_r = r;
+    selection.end_c   = end_c;
+    selection.end_r   = r;
+    selection.active  = 1;
+    needs_render      = 1;
+}
+
+static void select_line_at(int r) {
+    selection.start_c = 0;
+    selection.start_r = r;
+    selection.end_c   = cols - 1;
+    selection.end_r   = r;
+    selection.active  = 1;
+    needs_render      = 1;
+}
+
+static void clear_selection(void) {
+    if (selection.active || selection.selecting) {
+        selection.active = 0;
+        selection.selecting = 0;
+        needs_render = 1;
+    }
+}
+
+static void copy_selection_to_clipboard(void) {
+    if (!selection.active) return;
+    int r1, c1, r2, c2;
+    normalize_selection(&r1, &c1, &r2, &c2);
+
+    size_t cap = (size_t)(r2 - r1 + 1) * (size_t)cols * 4 + 64;
+    char *buf = malloc(cap);
+    if (!buf) return;
+
+    size_t len = 0;
+    for (int r = r1; r <= r2; r++) {
+        int sc = (r == r1) ? c1 : 0;
+        int ec = (r == r2) ? c2 : cols - 1;
+
+        int last_nb = sc - 1;
+        for (int c = ec; c >= sc; c--) {
+            cell_t cell = get_visible_cell(r, c);
+            if (!is_blank_cell(cell)) {
+                last_nb = c;
+                break;
+            }
+        }
+
+        for (int c = sc; c <= last_nb; c++) {
+            cell_t cell = get_visible_cell(r, c);
+            if (cell.width == 0) continue; /* Skip trailing half of wide char */
+            uint32_t cp = cell.codepoint ? cell.codepoint : ' ';
+            len += (size_t)utf8_encode(cp, buf + len);
+        }
+
+        /* If not at the last selected line, add newline */
+        if (r < r2) {
+            buf[len++] = '\n';
+        }
+    }
+    buf[len] = '\0';
+
+    if (len > 0) {
+        SDL_SetClipboardText(buf);
+    }
+    free(buf);
+}
+
+static void paste_from_clipboard(void) {
+    if (!SDL_HasClipboardText()) return;
+    char *text = SDL_GetClipboardText();
+    if (!text || !*text) {
+        if (text) SDL_free(text);
+        return;
+    }
+
+    if (bracketed_paste_mode) {
+        pty_write("\x1b[200~", 6);
+        pty_write(text, strlen(text));
+        pty_write("\x1b[201~", 6);
+    } else {
+        pty_write(text, strlen(text));
+    }
+    SDL_free(text);
+}
+
 /* Recompute grid dimensions from the new window pixel size, anchor active content
  * when height shrinks, copy existing cells, and notify the PTY. */
 static void resize_terminal(int new_w, int new_h) {
+    clear_selection();
     int sb_h = get_status_bar_height();
     int new_cols = (new_w > 16 && char_w > 0) ? (new_w - 16) / char_w : 1;
     int new_rows = (new_h > 16 + sb_h && char_h > 0) ? (new_h - 16 - sb_h) / char_h : 1;
@@ -609,6 +1153,8 @@ static void resize_terminal(int new_w, int new_h) {
     screens[active_buffer].rows        = new_rows;
     screens[active_buffer].cursor      = cursor;
     screens[active_buffer].wrap_next   = wrap_next;
+    screens[active_buffer].scroll_top    = 0;
+    screens[active_buffer].scroll_bottom = new_rows - 1;
 
     /* 6. Notify the PTY of the new dimensions (triggers SIGWINCH in child shell) */
     struct winsize ws = {
@@ -658,6 +1204,13 @@ static void switch_buffer(buffer_type_t target) {
         screens[active_buffer].wrap_next   = 0;
         screens[active_buffer].saved_cursor.x = 0;
         screens[active_buffer].saved_cursor.y = 0;
+        screens[active_buffer].scroll_top     = 0;
+        screens[active_buffer].scroll_bottom  = target_rows - 1;
+        screens[active_buffer].cursor_visible = 1;
+        screens[active_buffer].auto_wrap      = 1;
+        screens[active_buffer].app_cursor_keys= 0;
+        screens[active_buffer].mouse_tracking = 0;
+        screens[active_buffer].mouse_sgr      = 0;
     }
 
     term_buffer = screens[active_buffer].cells;
@@ -761,12 +1314,121 @@ void event_handler(){
                 needs_render = 1;
             } 
         } else if (ev.type == SDL_MOUSEWHEEL) {
-            int delta = ev.wheel.y;
-            if (delta != 0 && has_status_bar()) {
-                scroll_offset += delta * 3;
-                if (scroll_offset > scrollback_count) scroll_offset = scrollback_count;
-                if (scroll_offset < 0) scroll_offset = 0;
-                needs_render = 1;
+            int shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
+            if (screens[active_buffer].mouse_tracking && !shift) {
+                int c, r;
+                int mx, my;
+                SDL_GetMouseState(&mx, &my);
+                pixel_to_cell(mx, my, &c, &r);
+                int btn = (ev.wheel.y > 0) ? 64 : 65;
+                char buf[32];
+                snprintf(buf, sizeof(buf), "\x1b[<%d;%d;%dM", btn, c + 1, r + 1);
+                pty_write(buf, strlen(buf));
+            } else {
+                int delta = ev.wheel.y;
+                if (delta != 0 && has_status_bar()) {
+                    scroll_offset += delta * 3;
+                    if (scroll_offset > scrollback_count) scroll_offset = scrollback_count;
+                    if (scroll_offset < 0) scroll_offset = 0;
+                    needs_render = 1;
+                }
+            }
+        } else if (ev.type == SDL_MOUSEBUTTONDOWN) {
+            int shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
+            if (screens[active_buffer].mouse_tracking && !shift) {
+                int c, r;
+                pixel_to_cell(ev.button.x, ev.button.y, &c, &r);
+                int btn = 0;
+                if (ev.button.button == SDL_BUTTON_LEFT)   btn = 0;
+                if (ev.button.button == SDL_BUTTON_MIDDLE) btn = 1;
+                if (ev.button.button == SDL_BUTTON_RIGHT)  btn = 2;
+                char buf[32];
+                snprintf(buf, sizeof(buf), "\x1b[<%d;%d;%dM", btn, c + 1, r + 1);
+                pty_write(buf, strlen(buf));
+            } else {
+                if (ev.button.button == SDL_BUTTON_LEFT) {
+                    int c, r;
+                    pixel_to_cell(ev.button.x, ev.button.y, &c, &r);
+
+                    uint32_t now = SDL_GetTicks();
+                    if (now - selection.last_click_time < 400) {
+                        selection.click_count++;
+                    } else {
+                        selection.click_count = 1;
+                    }
+                    selection.last_click_time = now;
+
+                    if (selection.click_count == 2) {
+                        select_word_at(c, r);
+                        copy_selection_to_clipboard();
+                    } else if (selection.click_count >= 3) {
+                        select_line_at(r);
+                        copy_selection_to_clipboard();
+                    } else {
+                        selection.start_c   = c;
+                        selection.start_r   = r;
+                        selection.end_c     = c;
+                        selection.end_r     = r;
+                        selection.selecting = 1;
+                        selection.active    = 0;
+                        needs_render        = 1;
+                    }
+                } else if (ev.button.button == SDL_BUTTON_MIDDLE) {
+                    paste_from_clipboard();
+                }
+            }
+        } else if (ev.type == SDL_MOUSEMOTION) {
+            int shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
+            if (screens[active_buffer].mouse_tracking && !shift) {
+                if (screens[active_buffer].mouse_tracking >= 2) {
+                    int c, r;
+                    pixel_to_cell(ev.motion.x, ev.motion.y, &c, &r);
+                    int btn = 32;
+                    if (ev.motion.state & SDL_BUTTON_LMASK)      btn += 0;
+                    else if (ev.motion.state & SDL_BUTTON_MMASK) btn += 1;
+                    else if (ev.motion.state & SDL_BUTTON_RMASK) btn += 2;
+                    else btn += 3;
+                    if (screens[active_buffer].mouse_tracking == 3 || (ev.motion.state & (SDL_BUTTON_LMASK | SDL_BUTTON_MMASK | SDL_BUTTON_RMASK))) {
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "\x1b[<%d;%d;%dM", btn, c + 1, r + 1);
+                        pty_write(buf, strlen(buf));
+                    }
+                }
+            } else {
+                if (selection.selecting && (ev.motion.state & SDL_BUTTON_LMASK)) {
+                    int c, r;
+                    pixel_to_cell(ev.motion.x, ev.motion.y, &c, &r);
+                    if (c != selection.end_c || r != selection.end_r) {
+                        selection.end_c  = c;
+                        selection.end_r  = r;
+                        selection.active = 1;
+                        needs_render     = 1;
+                    }
+                }
+            }
+        } else if (ev.type == SDL_MOUSEBUTTONUP) {
+            int shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
+            if (screens[active_buffer].mouse_tracking && !shift) {
+                int c, r;
+                pixel_to_cell(ev.button.x, ev.button.y, &c, &r);
+                int btn = 0;
+                if (ev.button.button == SDL_BUTTON_LEFT)   btn = 0;
+                if (ev.button.button == SDL_BUTTON_MIDDLE) btn = 1;
+                if (ev.button.button == SDL_BUTTON_RIGHT)  btn = 2;
+                char buf[32];
+                snprintf(buf, sizeof(buf), "\x1b[<%d;%d;%dm", btn, c + 1, r + 1);
+                pty_write(buf, strlen(buf));
+            } else {
+                if (ev.button.button == SDL_BUTTON_LEFT) {
+                    if (selection.selecting) {
+                        selection.selecting = 0;
+                        if (selection.active && (selection.start_c != selection.end_c || selection.start_r != selection.end_r)) {
+                            copy_selection_to_clipboard();
+                        } else if (selection.click_count == 1) {
+                            clear_selection();
+                        }
+                    }
+                }
             }
         } else if (ev.type == SDL_TEXTINPUT) {
             /* Drop text events produced while Ctrl is held (zoom shortcuts, Ctrl-combos) */
@@ -785,6 +1447,22 @@ void event_handler(){
             SDL_Keymod  mod = SDL_GetModState();
             int ctrl  = (mod & KMOD_CTRL)  != 0;
             int shift = (mod & KMOD_SHIFT) != 0;
+
+            /* Ctrl+Shift+C: Copy selected text to clipboard */
+            if (ctrl && shift && sym == SDLK_c) {
+                copy_selection_to_clipboard();
+                continue;
+            }
+            /* Ctrl+Shift+V: Paste text from clipboard */
+            if (ctrl && shift && sym == SDLK_v) {
+                paste_from_clipboard();
+                continue;
+            }
+            /* Shift+Insert: Paste text from clipboard */
+            if (shift && sym == SDLK_INSERT) {
+                paste_from_clipboard();
+                continue;
+            }
 
             /* Shift+PageUp / Shift+PageDown / Shift+Up / Shift+Down for viewport scroll */
             if (shift && sym == SDLK_PAGEUP) {
@@ -842,22 +1520,40 @@ void event_handler(){
 
             /* Special / non-printing keys that produce no SDL_TEXTINPUT event. */
             const char *seq = NULL;
+            int app_cursor = screens[active_buffer].app_cursor_keys;
             switch (sym) {
             case SDLK_RETURN:
             case SDLK_KP_ENTER: seq = "\r";       break; /* CR */
             case SDLK_BACKSPACE: seq = "\x7f";    break; /* DEL (PTY erase char) */
             case SDLK_TAB:       seq = "\t";      break;
             case SDLK_ESCAPE:    seq = "\x1b";    break;
-            case SDLK_UP:        seq = "\x1b[A";  break;
-            case SDLK_DOWN:      seq = "\x1b[B";  break;
-            case SDLK_RIGHT:     seq = "\x1b[C";  break;
-            case SDLK_LEFT:      seq = "\x1b[D";  break;
-            case SDLK_HOME:      seq = "\x1b[H";  break;
-            case SDLK_END:       seq = "\x1b[F";  break;
+            case SDLK_UP:        seq = app_cursor ? "\x1bOA" : "\x1b[A";  break;
+            case SDLK_DOWN:      seq = app_cursor ? "\x1bOB" : "\x1b[B";  break;
+            case SDLK_RIGHT:     seq = app_cursor ? "\x1bOC" : "\x1b[C";  break;
+            case SDLK_LEFT:      seq = app_cursor ? "\x1bOD" : "\x1b[D";  break;
+            case SDLK_HOME:      seq = app_cursor ? "\x1bOH" : "\x1b[H";  break;
+            case SDLK_END:       seq = app_cursor ? "\x1bOF" : "\x1b[F";  break;
             case SDLK_DELETE:    seq = "\x1b[3~"; break;
             case SDLK_PAGEUP:    seq = "\x1b[5~"; break;
             case SDLK_PAGEDOWN:  seq = "\x1b[6~"; break;
-            case SDLK_F11:       fullscreen = !fullscreen; break;
+            case SDLK_F1:        seq = "\x1bOP";  break;
+            case SDLK_F2:        seq = "\x1bOQ";  break;
+            case SDLK_F3:        seq = "\x1bOR";  break;
+            case SDLK_F4:        seq = "\x1bOS";  break;
+            case SDLK_F5:        seq = "\x1b[15~"; break;
+            case SDLK_F6:        seq = "\x1b[17~"; break;
+            case SDLK_F7:        seq = "\x1b[18~"; break;
+            case SDLK_F8:        seq = "\x1b[19~"; break;
+            case SDLK_F9:        seq = "\x1b[20~"; break;
+            case SDLK_F10:       seq = "\x1b[21~"; break;
+            case SDLK_F11:
+                if (shift) {
+                    seq = "\x1b[23~";
+                } else {
+                    fullscreen = !fullscreen;
+                }
+                break;
+            case SDLK_F12:       seq = "\x1b[24~"; break;
             default: break;
             }
             if (seq) pty_write(seq, strlen(seq));
@@ -888,20 +1584,33 @@ uint8_t read_pty(char* pty_buffer){
                 } else if (ch == ']') {          /* OSC — Operating System Command */
                     ansi_state = ANSI_OSC;
                     osc_len = 0;
+                } else if (ch == 'P' || ch == '_' || ch == '^') { /* DCS / APC / PM — absorb payload */
+                    ansi_state = ANSI_DCS;
+                } else if (ch == '(' || ch == ')' || ch == '*' || ch == '+' ||
+                           ch == '-' || ch == '.' || ch == '/' || ch == '%' || ch == '#') {
+                    /* Charset designator / DEC mode — absorb and drop the next byte */
+                    ansi_state = ANSI_ESC_DROP;
                 } else if (ch == 'c') {          /* RIS — full reset */
                     erase_display(2);
                     cursor.x = cursor.y = 0;
                     utf8_expected = 0;
                     utf8_codepoint = 0;
                     wrap_next = 0;
+                    reset_sgr();
+                    screens[active_buffer].scroll_top = 0;
+                    screens[active_buffer].scroll_bottom = rows - 1;
                     ansi_state = ANSI_NORMAL;
-                } else if (ch == 'M') {          /* RI — reverse index (cursor up) */
+                } else if (ch == 'M') {          /* RI — reverse index */
                     wrap_next = 0;
-                    if (cursor.y > 0) cursor.y--;
+                    int top = screens[active_buffer].scroll_top;
+                    int bottom = screens[active_buffer].scroll_bottom;
+                    if ((int)cursor.y == top) {
+                        scroll_region_down(top, bottom);
+                    } else if (cursor.y > 0) {
+                        cursor.y--;
+                    }
                     ansi_state = ANSI_NORMAL;
                 } else if (ch == '=' || ch == '>') { /* keypad mode, ignore */
-                    ansi_state = ANSI_NORMAL;
-                } else if (ch == '(' || ch == ')') { /* charset designator — drop next byte */
                     ansi_state = ANSI_NORMAL;
                 } else if (ch == '7') {          /* DECSC — save cursor */
                     screens[active_buffer].saved_cursor = cursor;
@@ -912,10 +1621,33 @@ uint8_t read_pty(char* pty_buffer){
                     if ((int)cursor.y >= rows) cursor.y = (uint32_t)(rows - 1);
                     wrap_next = 0;
                     ansi_state = ANSI_NORMAL;
-                } else if (ch == '\\') {         /* ST (String Terminator) after OSC — ignore lone ST */
+                } else if (ch == '\\') {         /* ST (String Terminator) */
                     ansi_state = ANSI_NORMAL;
                 } else {
                     ansi_state = ANSI_NORMAL; /* unknown two-char ESC seq */
+                }
+                continue;
+
+            case ANSI_ESC_DROP:
+                /* Consume the single trailing byte (e.g. 'B', '0') and return to normal */
+                ansi_state = ANSI_NORMAL;
+                continue;
+
+            case ANSI_DCS:
+                if (ch == 0x07) {
+                    ansi_state = ANSI_NORMAL;
+                } else if (ch == 0x1B) {
+                    ansi_state = ANSI_DCS_ESC;
+                }
+                continue;
+
+            case ANSI_DCS_ESC:
+                if (ch == '\\') {
+                    ansi_state = ANSI_NORMAL;
+                } else if (ch == 0x1B) {
+                    ansi_state = ANSI_DCS_ESC;
+                } else {
+                    ansi_state = ANSI_DCS;
                 }
                 continue;
 
@@ -992,11 +1724,12 @@ uint8_t read_pty(char* pty_buffer){
                 if (row_wrapped && (int)cursor.y < rows) {
                     row_wrapped[cursor.y] = 0;
                 }
-                /* LF: move cursor down; scroll the screen if at the last row */
-                if ((int)cursor.y + 1 < rows) {
+                int top = screens[active_buffer].scroll_top;
+                int bottom = screens[active_buffer].scroll_bottom;
+                if ((int)cursor.y == bottom) {
+                    scroll_region_up(top, bottom);
+                } else if ((int)cursor.y + 1 < rows) {
                     cursor.y++;
-                } else {
-                    scroll_up(); /* cursor.y stays at rows-1 */
                 }
                 continue;
             }
@@ -1092,16 +1825,23 @@ uint8_t read_pty(char* pty_buffer){
 
             /* ── Write codepoint into cell buffer ── */
             if (wrap_next) {
-                if (row_wrapped && (int)cursor.y < rows) {
-                    row_wrapped[cursor.y] = 1;
-                }
-                cursor.x = 0;
-                if ((int)cursor.y + 1 < rows) {
-                    cursor.y++;
+                if (!screens[active_buffer].auto_wrap) {
+                    cursor.x = (uint32_t)(cols - 1);
+                    wrap_next = 0;
                 } else {
-                    scroll_up();
+                    if (row_wrapped && (int)cursor.y < rows) {
+                        row_wrapped[cursor.y] = 1;
+                    }
+                    cursor.x = 0;
+                    int top = screens[active_buffer].scroll_top;
+                    int bottom = screens[active_buffer].scroll_bottom;
+                    if ((int)cursor.y == bottom) {
+                        scroll_region_up(top, bottom);
+                    } else if ((int)cursor.y + 1 < rows) {
+                        cursor.y++;
+                    }
+                    wrap_next = 0;
                 }
-                wrap_next = 0;
             }
 
             if (w == 2) {
@@ -1115,27 +1855,41 @@ uint8_t read_pty(char* pty_buffer){
                         row_wrapped[cursor.y] = 1;
                     }
                     cursor.x = 0;
-                    if ((int)cursor.y + 1 < rows) {
+                    int top = screens[active_buffer].scroll_top;
+                    int bottom = screens[active_buffer].scroll_bottom;
+                    if ((int)cursor.y == bottom) {
+                        scroll_region_up(top, bottom);
+                    } else if ((int)cursor.y + 1 < rows) {
                         cursor.y++;
-                    } else {
-                        scroll_up();
                     }
                 }
                 if ((int)cursor.y < rows) {
                     cell_t c1;
-                    c1.codepoint = cp;
-                    c1.fg        = current_fg;
-                    c1.bg        = current_bg;
-                    c1.bold      = current_bold;
-                    c1.width     = 2;
+                    memset(&c1, 0, sizeof(c1));
+                    c1.codepoint     = cp;
+                    c1.fg            = current_fg;
+                    c1.bg            = current_bg;
+                    c1.bold          = current_bold;
+                    c1.dim           = current_dim;
+                    c1.underline     = current_underline;
+                    c1.reverse       = current_reverse;
+                    c1.is_default_fg = current_is_default_fg;
+                    c1.is_default_bg = current_is_default_bg;
+                    c1.width         = 2;
                     term_buffer[cursor.y * cols + cursor.x] = c1;
 
                     cell_t c2;
-                    c2.codepoint = 0;
-                    c2.fg        = current_fg;
-                    c2.bg        = current_bg;
-                    c2.bold      = current_bold;
-                    c2.width     = 0; /* trailing half */
+                    memset(&c2, 0, sizeof(c2));
+                    c2.codepoint     = 0;
+                    c2.fg            = current_fg;
+                    c2.bg            = current_bg;
+                    c2.bold          = current_bold;
+                    c2.dim           = current_dim;
+                    c2.underline     = current_underline;
+                    c2.reverse       = current_reverse;
+                    c2.is_default_fg = current_is_default_fg;
+                    c2.is_default_bg = current_is_default_bg;
+                    c2.width         = 0; /* trailing half */
                     term_buffer[cursor.y * cols + cursor.x + 1] = c2;
 
                     if ((int)cursor.x + 2 >= cols) {
@@ -1149,11 +1903,17 @@ uint8_t read_pty(char* pty_buffer){
                 /* Standard single-column character */
                 if ((int)cursor.y < rows) {
                     cell_t cell;
-                    cell.codepoint = cp;
-                    cell.fg        = current_fg;
-                    cell.bg        = current_bg;
-                    cell.bold      = current_bold;
-                    cell.width     = 1;
+                    memset(&cell, 0, sizeof(cell));
+                    cell.codepoint     = cp;
+                    cell.fg            = current_fg;
+                    cell.bg            = current_bg;
+                    cell.bold          = current_bold;
+                    cell.dim           = current_dim;
+                    cell.underline     = current_underline;
+                    cell.reverse       = current_reverse;
+                    cell.is_default_fg = current_is_default_fg;
+                    cell.is_default_bg = current_is_default_bg;
+                    cell.width         = 1;
                     term_buffer[cursor.y * cols + cursor.x] = cell;
 
                     if ((int)cursor.x + 1 >= cols) {
@@ -1727,42 +2487,54 @@ void render(SDL_Renderer* renderer, SDL_Texture* text_texture, TTF_Font* font, T
                 (int)char_h
             };
 
-            int is_cursor = (scroll_offset == 0 && r == (int)cursor.y && c == (int)cursor.x);
+            int is_cursor = (scroll_offset == 0 && r == (int)cursor.y && c == (int)cursor.x && screens[active_buffer].cursor_visible);
+            int is_selected = is_cell_selected(r, c);
 
             /* If cursor rests on a 2-width cell, expand cursor block */
             if (is_cursor && cell.width == 2) {
                 cell_rect.w = (int)(2 * char_w);
             }
 
-            /* Render cell background if not default (or cursor block) */
+            SDL_Color fg_col = cell.fg;
+            SDL_Color bg_col = cell.bg;
+            if (cell.reverse) {
+                SDL_Color tmp = fg_col;
+                fg_col = bg_col;
+                bg_col = tmp;
+            }
+            if (cell.bold && !cell.reverse && cell.is_default_fg) {
+                fg_col = ansi_palette[15];
+            } else if (cell.dim) {
+                fg_col.r = (uint8_t)(fg_col.r * 2 / 3);
+                fg_col.g = (uint8_t)(fg_col.g * 2 / 3);
+                fg_col.b = (uint8_t)(fg_col.b * 2 / 3);
+            }
+
+            /* Render cell background if not default (or cursor block / selection) */
             if (is_cursor) {
-                SDL_Color cur_col = cursor_color;
-                uint8_t fg_idx = cell.fg;
-                if (cell.bold && fg_idx < 8) fg_idx += 8;
-                if (fg_idx < 16 && fg_idx != 15 && fg_idx != ATTR_DEFAULT_FG) {
-                    cur_col = ansi_palette[fg_idx];
-                }
-                SDL_SetRenderDrawColor(renderer, cur_col.r, cur_col.g, cur_col.b, cur_col.a);
+                SDL_SetRenderDrawColor(renderer, cursor_color.r, cursor_color.g, cursor_color.b, cursor_color.a);
                 SDL_RenderFillRect(renderer, &cell_rect);
-            } else if (cell.bg != ATTR_DEFAULT_BG && cell.bg < 16) {
-                SDL_Color bg_col = ansi_palette[cell.bg];
+                fg_col = default_bg; /* Invert text color so character remains visible on cursor */
+            } else if (is_selected) {
+                SDL_SetRenderDrawColor(renderer, selection_bg.r, selection_bg.g, selection_bg.b, selection_bg.a);
+                SDL_RenderFillRect(renderer, &cell_rect);
+                fg_col = ansi_palette[15]; /* Crisp Bright White on selection highlight */
+            } else if (!cell.is_default_bg || cell.reverse) {
                 SDL_SetRenderDrawColor(renderer, bg_col.r, bg_col.g, bg_col.b, bg_col.a);
                 SDL_RenderFillRect(renderer, &cell_rect);
+            }
+
+            /* Draw underline */
+            if (cell.underline) {
+                SDL_SetRenderDrawColor(renderer, fg_col.r, fg_col.g, fg_col.b, fg_col.a);
+                SDL_RenderDrawLine(renderer, cell_rect.x, cell_rect.y + cell_rect.h - 1,
+                                   cell_rect.x + cell_rect.w, cell_rect.y + cell_rect.h - 1);
             }
 
             /* Skip trailing half of wide character */
             if (cell.width == 0) continue;
             /* Skip empty or space cell */
             if (cell.codepoint <= ' ') continue;
-
-            uint8_t fg_idx = cell.fg;
-            if (cell.bold && fg_idx < 8) fg_idx += 8;
-            SDL_Color fg_col;
-            if (is_cursor) {
-                fg_col = default_bg; /* Invert text color so character remains visible on cursor */
-            } else {
-                fg_col = (fg_idx == ATTR_DEFAULT_FG || fg_idx >= 16) ? default_fg : ansi_palette[fg_idx];
-            }
 
             /* 1. Procedural block elements (█, ▀, ▄, ▌, ▐, fractions, shades) */
             if (render_block_element(renderer, cell.codepoint, cell_rect, fg_col)) {
@@ -1905,6 +2677,14 @@ int main(void) {
     screens[BUFFER_MAIN].wrap_next   = 0;
     screens[BUFFER_MAIN].saved_cursor.x = 0;
     screens[BUFFER_MAIN].saved_cursor.y = 0;
+    screens[BUFFER_MAIN].scroll_top     = 0;
+    screens[BUFFER_MAIN].scroll_bottom  = rows - 1;
+    screens[BUFFER_MAIN].cursor_visible = 1;
+    screens[BUFFER_MAIN].auto_wrap      = 1;
+    screens[BUFFER_MAIN].app_cursor_keys= 0;
+    screens[BUFFER_MAIN].mouse_tracking = 0;
+    screens[BUFFER_MAIN].mouse_sgr      = 0;
+    reset_sgr();
     SDL_Texture *text_texture = NULL;
 
     SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);

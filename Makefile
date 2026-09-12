@@ -8,7 +8,7 @@ TARGET   := fatty
 SRCS     := fatty.c
 OBJS     := $(SRCS:.c=.o)
 
-.PHONY: all clean run
+.PHONY: all clean run test
 
 all: $(TARGET)
 
@@ -21,5 +21,11 @@ $(TARGET): $(OBJS)
 run: $(TARGET)
 	./$(TARGET)
 
+test:
+	$(CC) $(CFLAGS) test_suite.c -o test_suite $(LDFLAGS)
+	./test_suite
+	rm -f test_suite
+
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET) test_suite
+
