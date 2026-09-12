@@ -1,3 +1,5 @@
+/* ── Includes ───────────────────────────────────────────────────────────── */
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,9 +14,12 @@
 #include <pty.h>
 #include <locale.h>
 #include <wchar.h>
+#include <time.h>
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
+
+/* ── Constant & Variables ───────────────────────────────────────────────── */
 
 #define DEFAULT_COLS 80
 #define DEFAULT_ROWS 24
@@ -97,71 +102,47 @@ cursor_t cursor = {0,0};
 typedef struct {
     cell_t *cells;
     int     cols;
+    uint8_t wrapped; /* 1 if line wrapped onto next row without \n */
 } scroll_row_t;
 
 static scroll_row_t scrollback[SCROLLBACK_MAX_LINES];
 static int scrollback_head  = 0;
 static int scrollback_count = 0;
 static int scroll_offset    = 0;
+static uint8_t *row_wrapped = NULL;
+static uint8_t  wrap_next   = 0;
 
-static void scrollback_push_row(const cell_t *row, int num_cols) {
-    scroll_row_t *slot = &scrollback[scrollback_head];
-    if (slot->cols != num_cols) {
-        free(slot->cells);
-        slot->cells = malloc((size_t)num_cols * sizeof(cell_t));
-        slot->cols  = num_cols;
-    }
-    if (slot->cells) {
-        memcpy(slot->cells, row, (size_t)num_cols * sizeof(cell_t));
-    }
-    scrollback_head = (scrollback_head + 1) % SCROLLBACK_MAX_LINES;
-    if (scrollback_count < SCROLLBACK_MAX_LINES) {
-        scrollback_count++;
-    }
-    if (scroll_offset > 0 && scroll_offset < scrollback_count) {
-        scroll_offset++;
-    }
+/* ── Screen buffer abstraction ─────────────────────────────────────────── */
+
+typedef enum {
+    BUFFER_MAIN = 0,
+    BUFFER_ALT  = 1
+} buffer_type_t;
+
+typedef struct {
+    cell_t   *cells;        /* Grid cells for this screen buffer */
+    uint8_t  *row_wrapped;  /* Wrapped line tracking */
+    int       cols;         /* Column count for this buffer */
+    int       rows;         /* Row count for this buffer */
+    cursor_t  cursor;       /* Cursor position */
+    uint8_t   wrap_next;    /* Pending wrap flag at margin */
+    cursor_t  saved_cursor; /* Saved cursor for ESC 7 / ESC 8 */
+} screen_buffer_t;
+
+static screen_buffer_t screens[2];
+static buffer_type_t   active_buffer = BUFFER_MAIN;
+
+static inline int has_status_bar(void) {
+    return active_buffer == BUFFER_MAIN;
 }
 
-static void clear_scrollback(void) {
-    for (int i = 0; i < SCROLLBACK_MAX_LINES; i++) {
-        if (scrollback[i].cells) {
-            free(scrollback[i].cells);
-            scrollback[i].cells = NULL;
-            scrollback[i].cols  = 0;
-        }
-    }
-    scrollback_head  = 0;
-    scrollback_count = 0;
-    scroll_offset    = 0;
+static inline int get_status_bar_height(void) {
+    return has_status_bar() ? (char_h + 6) : 0;
 }
 
-static cell_t get_visible_cell(int r, int c) {
-    if (scroll_offset == 0) {
-        if (r >= 0 && r < rows && c >= 0 && c < cols)
-            return term_buffer[r * cols + c];
-        return make_blank_cell();
-    }
-
-    int view_index = (scrollback_count - scroll_offset) + r;
-    if (view_index < 0) {
-        return make_blank_cell();
-    } else if (view_index < scrollback_count) {
-        int oldest = (scrollback_head - scrollback_count + SCROLLBACK_MAX_LINES) % SCROLLBACK_MAX_LINES;
-        int slot   = (oldest + view_index) % SCROLLBACK_MAX_LINES;
-        if (c >= 0 && c < scrollback[slot].cols && scrollback[slot].cells) {
-            return scrollback[slot].cells[c];
-        }
-        return make_blank_cell();
-    } else {
-        int live_r = view_index - scrollback_count;
-        if (live_r >= 0 && live_r < rows && c >= 0 && c < cols) {
-            return term_buffer[live_r * cols + c];
-        }
-        return make_blank_cell();
-    }
-}
-
+static void resize_terminal(int new_w, int new_h);
+static void switch_buffer(buffer_type_t target);
+static void clear_scrollback();
 uint8_t running = 1, needs_render = 1;
 static int master_fd = -1;
 
@@ -208,6 +189,12 @@ static void erase_line(int mode) {
     if (mode == 2) { start = 0; end = cols; }
     for (int i = start; i < end && i < cols; i++)
         term_buffer[cursor.y * cols + i] = make_blank_cell();
+    if (mode == 0 || mode == 2) {
+        if (row_wrapped && (int)cursor.y < rows) {
+            row_wrapped[cursor.y] = 0;
+        }
+    }
+    wrap_next = 0;
 }
 
 static void erase_display(int mode) {
@@ -217,19 +204,27 @@ static void erase_display(int mode) {
     } else if (mode == 2) {
         for (size_t i = 0; i < (size_t)cols * (size_t)rows; i++)
             term_buffer[i] = make_blank_cell();
+        if (row_wrapped) {
+            memset(row_wrapped, 0, (size_t)rows * sizeof(uint8_t));
+        }
     } else if (mode == 0) {
         /* cursor to end of screen */
         erase_line(0);
-        for (int r = (int)cursor.y + 1; r < rows; r++)
+        for (int r = (int)cursor.y + 1; r < rows; r++) {
             for (int c = 0; c < cols; c++)
                 term_buffer[r * cols + c] = make_blank_cell();
+            if (row_wrapped) row_wrapped[r] = 0;
+        }
     } else if (mode == 1) {
         /* beginning of screen to cursor */
-        for (int r = 0; r < (int)cursor.y; r++)
+        for (int r = 0; r < (int)cursor.y; r++) {
             for (int c = 0; c < cols; c++)
                 term_buffer[r * cols + c] = make_blank_cell();
+            if (row_wrapped) row_wrapped[r] = 0;
+        }
         erase_line(1);
     }
+    wrap_next = 0;
 }
 
 /* Handle a completed OSC (Operating System Command) sequence.
@@ -345,44 +340,53 @@ static void dispatch_csi(const char *params, char final) {
     switch (final) {
     /* ── Cursor movement ──────────────────────────────────────── */
     case 'A': /* Cursor Up */
+        wrap_next = 0;
         { int n = p1 ? p1 : 1;
           cursor.y = (cursor.y >= (uint32_t)n) ? cursor.y - n : 0; }
         break;
     case 'B': /* Cursor Down */
+        wrap_next = 0;
         { int n = p1 ? p1 : 1;
           if ((int)cursor.y + n < rows) cursor.y += n;
           else cursor.y = (uint32_t)(rows - 1); }
         break;
     case 'C': /* Cursor Forward */
+        wrap_next = 0;
         { int n = p1 ? p1 : 1;
           cursor.x = (int)cursor.x + n < cols ? cursor.x + n : (uint32_t)(cols - 1); }
         break;
     case 'D': /* Cursor Back */
+        wrap_next = 0;
         { int n = p1 ? p1 : 1;
           cursor.x = (cursor.x >= (uint32_t)n) ? cursor.x - n : 0; }
         break;
     case 'E': /* Cursor Next Line */
+        wrap_next = 0;
         { int n = p1 ? p1 : 1;
           cursor.x = 0;
           cursor.y = (int)cursor.y + n < rows ? cursor.y + n : (uint32_t)(rows - 1); }
         break;
     case 'F': /* Cursor Previous Line */
+        wrap_next = 0;
         { int n = p1 ? p1 : 1;
           cursor.x = 0;
           cursor.y = (cursor.y >= (uint32_t)n) ? cursor.y - n : 0; }
         break;
     case 'G': /* Cursor Horizontal Absolute */
+        wrap_next = 0;
         { int col = p1 ? p1 - 1 : 0;
           cursor.x = col < cols ? (uint32_t)col : (uint32_t)(cols - 1); }
         break;
     case 'H': /* Cursor Position  ESC[row;colH  (1-based) */
     case 'f': /* same as H */
+        wrap_next = 0;
         { int row = p1 ? p1 - 1 : 0;
           int col = p2 ? p2 - 1 : 0;
           cursor.y = row < rows ? (uint32_t)row : (uint32_t)(rows - 1);
           cursor.x = col < cols ? (uint32_t)col : (uint32_t)(cols - 1); }
         break;
     case 'd': /* Line Position Absolute (row, 1-based) */
+        wrap_next = 0;
         { int row = p1 ? p1 - 1 : 0;
           cursor.y = row < rows ? (uint32_t)row : (uint32_t)(rows - 1); }
         break;
@@ -400,7 +404,32 @@ static void dispatch_csi(const char *params, char final) {
         handle_sgr(params);
         break;
     case 'h': /* Set mode / private mode on  */
+        if (params && (strstr(params, "?1049") || strstr(params, "?1047") || strstr(params, "?47"))) {
+            switch_buffer(BUFFER_ALT);
+            if (strstr(params, "1049")) {
+                for (size_t i = 0; i < (size_t)cols * (size_t)rows; i++) {
+                    term_buffer[i] = make_blank_cell();
+                }
+                if (row_wrapped) memset(row_wrapped, 0, (size_t)rows);
+                cursor.x = 0;
+                cursor.y = 0;
+                wrap_next = 0;
+            }
+        }
+        break;
     case 'l': /* Reset mode / private mode off */
+        if (params && (strstr(params, "?1049") || strstr(params, "?1047") || strstr(params, "?47"))) {
+            switch_buffer(BUFFER_MAIN);
+        }
+        break;
+    case 's': /* Save cursor position */
+        screens[active_buffer].saved_cursor = cursor;
+        break;
+    case 'u': /* Restore cursor position */
+        cursor = screens[active_buffer].saved_cursor;
+        if ((int)cursor.x >= cols) cursor.x = (uint32_t)(cols - 1);
+        if ((int)cursor.y >= rows) cursor.y = (uint32_t)(rows - 1);
+        wrap_next = 0;
         break;
     case 'r': /* DECSTBM — set scrolling region (ignored) */
         break;
@@ -415,60 +444,243 @@ static void dispatch_csi(const char *params, char final) {
 
 /* ── Scroll & resize ────────────────────────────────────────────────────── */
 
+static inline int is_blank_cell(cell_t c) {
+    return (c.codepoint == 0 || c.codepoint == ' ') && c.bg == ATTR_DEFAULT_BG;
+}
+
+static void scrollback_push_row(const cell_t *row, int num_cols, uint8_t wrapped) {
+    scroll_row_t *slot = &scrollback[scrollback_head];
+    if (slot->cols != num_cols) {
+        free(slot->cells);
+        slot->cells = malloc((size_t)num_cols * sizeof(cell_t));
+        slot->cols  = num_cols;
+    }
+    slot->wrapped = wrapped;
+    if (slot->cells) {
+        memcpy(slot->cells, row, (size_t)num_cols * sizeof(cell_t));
+    }
+    scrollback_head = (scrollback_head + 1) % SCROLLBACK_MAX_LINES;
+    if (scrollback_count < SCROLLBACK_MAX_LINES) {
+        scrollback_count++;
+    }
+    if (scroll_offset > 0 && scroll_offset < scrollback_count) {
+        scroll_offset++;
+    }
+}
+
+static void clear_scrollback(void) {
+    for (int i = 0; i < SCROLLBACK_MAX_LINES; i++) {
+        if (scrollback[i].cells) {
+            free(scrollback[i].cells);
+            scrollback[i].cells = NULL;
+            scrollback[i].cols  = 0;
+            scrollback[i].wrapped = 0;
+        }
+    }
+    scrollback_head  = 0;
+    scrollback_count = 0;
+    scroll_offset    = 0;
+}
+
 /* Shift the entire screen up by one row, clearing the bottom line. */
 static void scroll_up(void) {
-    /* Preserve top row in scrollback ring buffer */
-    scrollback_push_row(term_buffer, cols);
+    /* Preserve top row in scrollback ring buffer (only for primary screen buffer) */
+    if (has_status_bar()) {
+        scrollback_push_row(term_buffer, cols, row_wrapped ? row_wrapped[0] : 0);
+    }
 
     memmove(term_buffer,
             term_buffer + cols,
             (size_t)(rows - 1) * (size_t)cols * sizeof(cell_t));
+    if (row_wrapped) {
+        memmove(row_wrapped,
+                row_wrapped + 1,
+                (size_t)(rows - 1) * sizeof(uint8_t));
+        row_wrapped[rows - 1] = 0;
+    }
     for (int i = 0; i < cols; i++) {
         term_buffer[(rows - 1) * cols + i] = make_blank_cell();
     }
 }
 
-/* Recompute grid dimensions from the new window pixel size, realloc the
- * term_buffer, clamp the cursor, and notify the PTY of the new winsize. */
+static cell_t get_visible_cell(int r, int c) {
+    if (scroll_offset == 0) {
+        if (r >= 0 && r < rows && c >= 0 && c < cols)
+            return term_buffer[r * cols + c];
+        return make_blank_cell();
+    }
+
+    int view_index = (scrollback_count - scroll_offset) + r;
+    if (view_index < 0) {
+        return make_blank_cell();
+    } else if (view_index < scrollback_count) {
+        int oldest = ((scrollback_head - scrollback_count) % SCROLLBACK_MAX_LINES + SCROLLBACK_MAX_LINES) % SCROLLBACK_MAX_LINES;
+        int slot   = (oldest + view_index) % SCROLLBACK_MAX_LINES;
+        if (c >= 0 && c < scrollback[slot].cols && scrollback[slot].cells) {
+            return scrollback[slot].cells[c];
+        }
+        return make_blank_cell();
+    } else {
+        int live_r = view_index - scrollback_count;
+        if (live_r >= 0 && live_r < rows && c >= 0 && c < cols) {
+            return term_buffer[live_r * cols + c];
+        }
+        return make_blank_cell();
+    }
+}
+
+/* Recompute grid dimensions from the new window pixel size, anchor active content
+ * when height shrinks, copy existing cells, and notify the PTY. */
 static void resize_terminal(int new_w, int new_h) {
-    int new_cols = (new_w - 16) / char_w;
-    int new_rows = (new_h - 16) / char_h;
+    int sb_h = get_status_bar_height();
+    int new_cols = (new_w > 16 && char_w > 0) ? (new_w - 16) / char_w : 1;
+    int new_rows = (new_h > 16 + sb_h && char_h > 0) ? (new_h - 16 - sb_h) / char_h : 1;
     win_width = new_w, win_height = new_h;
     if (new_cols < 1) new_cols = 1;
     if (new_rows < 1) new_rows = 1;
     if (new_cols == cols && new_rows == rows) return;
 
-    cell_t *new_buf = calloc((size_t)new_cols * (size_t)new_rows, sizeof(cell_t));
-    if (!new_buf) return; /* OOM — keep old buffer */
+    if (!term_buffer) {
+        cols = new_cols;
+        rows = new_rows;
+        return;
+    }
 
+    /* 1. If height is shrinking (new_rows < rows) and the cursor/prompt would fall
+     * below the new bottom of the screen, scroll up by the excess rows so the
+     * active prompt remains visible at the bottom.
+     * The rows pushed off the top are preserved safely in scrollback. */
+    if (new_rows < rows && (int)cursor.y >= new_rows) {
+        int slide = (int)cursor.y - (new_rows - 1);
+        for (int i = 0; i < slide; i++) {
+            scroll_up();
+        }
+        cursor.y = (uint32_t)(new_rows - 1);
+    }
+
+    /* 2. Allocate the new terminal buffer and wrap tracking array */
+    cell_t *new_buf = calloc((size_t)new_cols * (size_t)new_rows, sizeof(cell_t));
+    uint8_t *new_wrapped = calloc((size_t)new_rows, sizeof(uint8_t));
+    if (!new_buf || !new_wrapped) {
+        if (new_buf) free(new_buf);
+        if (new_wrapped) free(new_wrapped);
+        return;
+    }
     for (size_t i = 0; i < (size_t)new_cols * (size_t)new_rows; i++) {
         new_buf[i] = make_blank_cell();
     }
 
-    /* Copy as much existing content as fits into the new grid */
-    int copy_rows = rows < new_rows ? rows : new_rows;
-    int copy_cols = cols < new_cols ? cols : new_cols;
-    for (int r = 0; r < copy_rows; r++)
-        for (int c = 0; c < copy_cols; c++)
-            new_buf[r * new_cols + c] = term_buffer[r * cols + c];
+    /* 3. Copy existing cells into the new grid */
+    int copy_rows = (rows < new_rows) ? rows : new_rows;
+    int copy_cols = (cols < new_cols) ? cols : new_cols;
+    for (int r = 0; r < copy_rows; r++) {
+        memcpy(new_buf + r * new_cols, term_buffer + r * cols, (size_t)copy_cols * sizeof(cell_t));
+        if (row_wrapped) {
+            new_wrapped[r] = row_wrapped[r];
+        }
+        /* Boundary protection: if copy_cols cut a wide char in half at the margin,
+         * replace the dangling first half with a blank cell */
+        if (copy_cols == new_cols && new_cols > 0 && new_buf[r * new_cols + (new_cols - 1)].width == 2) {
+            new_buf[r * new_cols + (new_cols - 1)] = make_blank_cell();
+        }
+    }
 
+    /* 4. Free old buffer and replace with new buffer */
     free(term_buffer);
+    if (row_wrapped) free(row_wrapped);
     term_buffer = new_buf;
+    row_wrapped = new_wrapped;
     cols = new_cols;
     rows = new_rows;
 
-    /* Clamp cursor to new bounds */
+    /* 5. Clamp cursor to valid grid bounds */
     if ((int)cursor.x >= cols) cursor.x = (uint32_t)(cols - 1);
     if ((int)cursor.y >= rows) cursor.y = (uint32_t)(rows - 1);
+    wrap_next = 0;
 
-    /* Signal PTY of new dimensions */
+    /* Clamp scroll offset to valid history range */
+    if (scroll_offset > scrollback_count) scroll_offset = scrollback_count;
+    if (scroll_offset < 0) scroll_offset = 0;
+
+    /* Sync screen buffer state */
+    screens[active_buffer].cells       = new_buf;
+    screens[active_buffer].row_wrapped = new_wrapped;
+    screens[active_buffer].cols        = new_cols;
+    screens[active_buffer].rows        = new_rows;
+    screens[active_buffer].cursor      = cursor;
+    screens[active_buffer].wrap_next   = wrap_next;
+
+    /* 6. Notify the PTY of the new dimensions (triggers SIGWINCH in child shell) */
     struct winsize ws = {
         .ws_row    = (unsigned short)rows,
         .ws_col    = (unsigned short)cols,
         .ws_xpixel = (unsigned short)new_w,
         .ws_ypixel = (unsigned short)new_h,
     };
-    ioctl(master_fd, TIOCSWINSZ, &ws);
+    if (master_fd >= 0) {
+        ioctl(master_fd, TIOCSWINSZ, &ws);
+    }
+}
+
+/* Switch between primary screen buffer and alternate screen buffer */
+static void switch_buffer(buffer_type_t target) {
+    if (active_buffer == target) return;
+
+    /* Save current active buffer state */
+    screens[active_buffer].cells       = term_buffer;
+    screens[active_buffer].row_wrapped = row_wrapped;
+    screens[active_buffer].cols        = cols;
+    screens[active_buffer].rows        = rows;
+    screens[active_buffer].cursor      = cursor;
+    screens[active_buffer].wrap_next   = wrap_next;
+
+    active_buffer = target;
+
+    /* If target buffer not yet allocated, allocate with current window capacity */
+    if (!screens[active_buffer].cells) {
+        int sb_h = get_status_bar_height();
+        int target_cols = (win_width > 16 && char_w > 0) ? (win_width - 16) / char_w : cols;
+        int target_rows = (win_height > 16 + sb_h && char_h > 0) ? (win_height - 16 - sb_h) / char_h : rows;
+        if (target_cols < 1) target_cols = 1;
+        if (target_rows < 1) target_rows = 1;
+
+        screens[active_buffer].cells = calloc((size_t)target_cols * (size_t)target_rows, sizeof(cell_t));
+        screens[active_buffer].row_wrapped = calloc((size_t)target_rows, sizeof(uint8_t));
+        if (screens[active_buffer].cells) {
+            for (size_t i = 0; i < (size_t)target_cols * (size_t)target_rows; i++) {
+                screens[active_buffer].cells[i] = make_blank_cell();
+            }
+        }
+        screens[active_buffer].cols        = target_cols;
+        screens[active_buffer].rows        = target_rows;
+        screens[active_buffer].cursor.x    = 0;
+        screens[active_buffer].cursor.y    = 0;
+        screens[active_buffer].wrap_next   = 0;
+        screens[active_buffer].saved_cursor.x = 0;
+        screens[active_buffer].saved_cursor.y = 0;
+    }
+
+    term_buffer = screens[active_buffer].cells;
+    row_wrapped = screens[active_buffer].row_wrapped;
+    cols        = screens[active_buffer].cols;
+    rows        = screens[active_buffer].rows;
+    cursor      = screens[active_buffer].cursor;
+    wrap_next   = screens[active_buffer].wrap_next;
+
+    /* Recompute grid dimensions because status bar visibility changed */
+    if (win_width > 0 && win_height > 0) {
+        resize_terminal(win_width, win_height);
+        if (master_fd >= 0) {
+            struct winsize ws = {
+                .ws_row    = (unsigned short)rows,
+                .ws_col    = (unsigned short)cols,
+                .ws_xpixel = (unsigned short)win_width,
+                .ws_ypixel = (unsigned short)win_height,
+            };
+            ioctl(master_fd, TIOCSWINSZ, &ws);
+        }
+    }
+    needs_render = 1;
 }
 
 /* Adjust font size and recalculate terminal grid dimensions.
@@ -541,13 +753,16 @@ void event_handler(){
             if(ev.window.event == SDL_WINDOWEVENT_CLOSE){
                 running = 0;
                 break;
-            } else if (ev.window.event == SDL_WINDOWEVENT_RESIZED) {
+            } else if (ev.window.event == SDL_WINDOWEVENT_RESIZED ||
+                       ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                 resize_terminal(ev.window.data1, ev.window.data2);
+                needs_render = 1;
+            } else if (ev.window.event == SDL_WINDOWEVENT_EXPOSED) {
                 needs_render = 1;
             } 
         } else if (ev.type == SDL_MOUSEWHEEL) {
             int delta = ev.wheel.y;
-            if (delta != 0) {
+            if (delta != 0 && has_status_bar()) {
                 scroll_offset += delta * 3;
                 if (scroll_offset > scrollback_count) scroll_offset = scrollback_count;
                 if (scroll_offset < 0) scroll_offset = 0;
@@ -678,13 +893,24 @@ uint8_t read_pty(char* pty_buffer){
                     cursor.x = cursor.y = 0;
                     utf8_expected = 0;
                     utf8_codepoint = 0;
+                    wrap_next = 0;
                     ansi_state = ANSI_NORMAL;
                 } else if (ch == 'M') {          /* RI — reverse index (cursor up) */
+                    wrap_next = 0;
                     if (cursor.y > 0) cursor.y--;
                     ansi_state = ANSI_NORMAL;
                 } else if (ch == '=' || ch == '>') { /* keypad mode, ignore */
                     ansi_state = ANSI_NORMAL;
                 } else if (ch == '(' || ch == ')') { /* charset designator — drop next byte */
+                    ansi_state = ANSI_NORMAL;
+                } else if (ch == '7') {          /* DECSC — save cursor */
+                    screens[active_buffer].saved_cursor = cursor;
+                    ansi_state = ANSI_NORMAL;
+                } else if (ch == '8') {          /* DECRC — restore cursor */
+                    cursor = screens[active_buffer].saved_cursor;
+                    if ((int)cursor.x >= cols) cursor.x = (uint32_t)(cols - 1);
+                    if ((int)cursor.y >= rows) cursor.y = (uint32_t)(rows - 1);
+                    wrap_next = 0;
                     ansi_state = ANSI_NORMAL;
                 } else if (ch == '\\') {         /* ST (String Terminator) after OSC — ignore lone ST */
                     ansi_state = ANSI_NORMAL;
@@ -748,18 +974,24 @@ uint8_t read_pty(char* pty_buffer){
             if (ch == 0x1B) {
                 utf8_expected = 0;
                 utf8_codepoint = 0;
+                wrap_next = 0;
                 ansi_state = ANSI_ESC;
                 continue;
             }
             if (ch == '\r') {
                 utf8_expected = 0;
                 utf8_codepoint = 0;
+                wrap_next = 0;
                 cursor.x = 0;
                 continue;
             }
             if (ch == '\n') {
                 utf8_expected = 0;
                 utf8_codepoint = 0;
+                wrap_next = 0;
+                if (row_wrapped && (int)cursor.y < rows) {
+                    row_wrapped[cursor.y] = 0;
+                }
                 /* LF: move cursor down; scroll the screen if at the last row */
                 if ((int)cursor.y + 1 < rows) {
                     cursor.y++;
@@ -771,6 +1003,7 @@ uint8_t read_pty(char* pty_buffer){
             if (ch == '\b') {
                 utf8_expected = 0;
                 utf8_codepoint = 0;
+                wrap_next = 0;
                 if (cursor.x > 0) {
                     cursor.x--;
                     /* If backed up onto trailing cell of wide char, back up one more */
@@ -784,6 +1017,7 @@ uint8_t read_pty(char* pty_buffer){
             if (ch == '\t') {
                 utf8_expected = 0;
                 utf8_codepoint = 0;
+                wrap_next = 0;
                 /* advance to next 8-column tab stop */
                 cursor.x = (cursor.x + 8) & ~7u;
                 if ((int)cursor.x >= cols) cursor.x = (uint32_t)(cols - 1);
@@ -857,12 +1091,28 @@ uint8_t read_pty(char* pty_buffer){
             }
 
             /* ── Write codepoint into cell buffer ── */
+            if (wrap_next) {
+                if (row_wrapped && (int)cursor.y < rows) {
+                    row_wrapped[cursor.y] = 1;
+                }
+                cursor.x = 0;
+                if ((int)cursor.y + 1 < rows) {
+                    cursor.y++;
+                } else {
+                    scroll_up();
+                }
+                wrap_next = 0;
+            }
+
             if (w == 2) {
                 /* Double-width character: occupies 2 terminal columns */
                 if ((int)cursor.x + 1 >= cols) {
                     /* Cannot fit at end of row: pad with blank and wrap */
                     if ((int)cursor.x < cols && (int)cursor.y < rows) {
                         term_buffer[cursor.y * cols + cursor.x] = make_blank_cell();
+                    }
+                    if (row_wrapped && (int)cursor.y < rows) {
+                        row_wrapped[cursor.y] = 1;
                     }
                     cursor.x = 0;
                     if ((int)cursor.y + 1 < rows) {
@@ -888,18 +1138,15 @@ uint8_t read_pty(char* pty_buffer){
                     c2.width     = 0; /* trailing half */
                     term_buffer[cursor.y * cols + cursor.x + 1] = c2;
 
-                    cursor.x += 2;
+                    if ((int)cursor.x + 2 >= cols) {
+                        wrap_next = 1;
+                        cursor.x = (uint32_t)(cols - 1);
+                    } else {
+                        cursor.x += 2;
+                    }
                 }
             } else {
                 /* Standard single-column character */
-                if ((int)cursor.x >= cols) {
-                    cursor.x = 0;
-                    if ((int)cursor.y + 1 < rows) {
-                        cursor.y++;
-                    } else {
-                        scroll_up();
-                    }
-                }
                 if ((int)cursor.y < rows) {
                     cell_t cell;
                     cell.codepoint = cp;
@@ -908,7 +1155,12 @@ uint8_t read_pty(char* pty_buffer){
                     cell.bold      = current_bold;
                     cell.width     = 1;
                     term_buffer[cursor.y * cols + cursor.x] = cell;
-                    cursor.x++;
+
+                    if ((int)cursor.x + 1 >= cols) {
+                        wrap_next = 1;
+                    } else {
+                        cursor.x++;
+                    }
                 }
             }
         }
@@ -1367,6 +1619,90 @@ static SDL_Texture* get_cached_glyph(SDL_Renderer *renderer,
     return tex;
 }
 
+/* ── Bottom Status Bar (Main Buffer Only) ──────────────────────────────── */
+
+static void draw_status_text(SDL_Renderer *renderer, int x, int y, const char *str, SDL_Color color, uint8_t bold) {
+    int cur_x = x;
+    while (*str) {
+        uint32_t cp = (unsigned char)*str++;
+        int dw = 0, dh = 0;
+        SDL_Texture *tex = get_cached_glyph(renderer, cp, bold, color, &dw, &dh);
+        if (tex) {
+            int off_x = ((int)char_w > dw) ? ((int)char_w - dw) / 2 : 0;
+            int off_y = ((int)char_h > dh) ? ((int)char_h - dh) / 2 : 0;
+            SDL_Rect dst = { cur_x + off_x, y + off_y, dw, dh };
+            SDL_RenderCopy(renderer, tex, NULL, &dst);
+        }
+        cur_x += char_w;
+    }
+}
+
+static void render_status_bar(SDL_Renderer *renderer) {
+    if (!has_status_bar()) return;
+
+    int sb_h = get_status_bar_height();
+    if (sb_h <= 0 || win_height < sb_h) return;
+
+    int sb_y = win_height - sb_h;
+
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+
+    /* 1. Status bar background (Gruvbox dark statusline) */
+    SDL_Rect bg_rect = { 0, sb_y, win_width, sb_h };
+    SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
+    SDL_RenderFillRect(renderer, &bg_rect);
+
+    /* 2. Top separator border line */
+    //SDL_Rect sep_rect = { 0, sb_y, win_width, 1 };
+    //SDL_SetRenderDrawColor(renderer, 60, 56, 54, 255);
+    // SDL_RenderFillRect(renderer, &sep_rect);
+
+    int text_y = sb_y + 3;
+
+    /* 3. Left badge: fatty */
+    const char *badge = " fatty ";
+    int badge_len = (int)strlen(badge);
+    int badge_w = badge_len * char_w;
+    SDL_Rect badge_rect = { 8, sb_y , badge_w, sb_h };
+    SDL_SetRenderDrawColor(renderer, 60, 56, 54, 255);
+    SDL_RenderFillRect(renderer, &badge_rect);
+    draw_status_text(renderer, 8, text_y, badge, ansi_palette[11], 1); /* Bright Yellow, bold */
+
+    /* 4. Left info: cols x rows */
+    char dim_str[32];
+    snprintf(dim_str, sizeof(dim_str), " %dx%d ", cols, rows);
+    int dim_x = 8 + badge_w + 4;
+    draw_status_text(renderer, dim_x, text_y, dim_str, ansi_palette[7], 0); /* White/fg4 */
+
+    /* 5. Left info: Scroll offset indicator if scrolled up */
+    int cur_left = dim_x + (int)strlen(dim_str) * char_w + 4;
+    if (scroll_offset > 0) {
+        char scroll_str[32];
+        snprintf(scroll_str, sizeof(scroll_str), " [SCROLL +%d] ", scroll_offset);
+        draw_status_text(renderer, cur_left, text_y, scroll_str, ansi_palette[9], 1); /* Bright Red, bold */
+        cur_left += (int)strlen(scroll_str) * char_w + 4;
+    }
+
+    /* 6. Right side: Live clock (HH:MM:SS) */
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char time_str[32] = {0};
+    if (tm_info) {
+        strftime(time_str, sizeof(time_str), " %a %b %d, %H:%M ", tm_info);
+    } else {
+        snprintf(time_str, sizeof(time_str), " --- --- --, --:-- ");
+    }
+    int time_len = (int)strlen(time_str);
+    int time_w = time_len * char_w;
+    int time_x = win_width - 8 - time_w;
+    if (time_x > cur_left) {
+        SDL_Rect clock_bg = { time_x, sb_y, time_w, sb_h };
+        SDL_SetRenderDrawColor(renderer, 50, 48, 47, 255);
+        SDL_RenderFillRect(renderer, &clock_bg);
+        draw_status_text(renderer, time_x, text_y, time_str, default_fg, 0);
+    }
+}
+
 /* ── Renderer ───────────────────────────────────────────────────────────── */
 
 void render(SDL_Renderer* renderer, SDL_Texture* text_texture, TTF_Font* font, TTF_Font* font_bold, 
@@ -1479,6 +1815,8 @@ void render(SDL_Renderer* renderer, SDL_Texture* text_texture, TTF_Font* font, T
         SDL_RenderFillRect(renderer, &thumb_rect);
     }
 
+    render_status_bar(renderer);
+
     SDL_RenderPresent(renderer);
 }
 
@@ -1540,7 +1878,7 @@ int main(void) {
     }
 
     win_width  = char_w * cols + 16;
-    win_height = char_h * rows + 16;
+    win_height = char_h * rows + 16 + get_status_bar_height();
 
     window = SDL_CreateWindow(
             "fatty",
@@ -1552,10 +1890,21 @@ int main(void) {
         fprintf(stderr, "Window creation failed: %s\n", SDL_GetError());
         return 1;
     }
+    SDL_SetWindowMinimumSize(window,900,600);
     term_buffer = calloc((size_t)cols * (size_t)rows, sizeof(cell_t));
+    row_wrapped = calloc((size_t)rows, sizeof(uint8_t));
     for (size_t i = 0; i < (size_t)cols * (size_t)rows; i++) {
         term_buffer[i] = make_blank_cell();
     }
+    screens[BUFFER_MAIN].cells       = term_buffer;
+    screens[BUFFER_MAIN].row_wrapped = row_wrapped;
+    screens[BUFFER_MAIN].cols        = cols;
+    screens[BUFFER_MAIN].rows        = rows;
+    screens[BUFFER_MAIN].cursor.x    = 0;
+    screens[BUFFER_MAIN].cursor.y    = 0;
+    screens[BUFFER_MAIN].wrap_next   = 0;
+    screens[BUFFER_MAIN].saved_cursor.x = 0;
+    screens[BUFFER_MAIN].saved_cursor.y = 0;
     SDL_Texture *text_texture = NULL;
 
     SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
@@ -1593,6 +1942,8 @@ int main(void) {
 
     char pty_buffer[4096];
 
+    time_t last_clock_tick = 0;
+
     while (running) {
         event_handler();
         if (!running) break;
@@ -1611,6 +1962,16 @@ int main(void) {
         if (fds.revents & POLLIN) {
             if(!read_pty(pty_buffer)) break;
         }
+
+        /* 1-second live clock tick update for status bar */
+        if (has_status_bar()) {
+            time_t now = time(NULL);
+            if (now != last_clock_tick) {
+                last_clock_tick = now;
+                needs_render = 1;
+            }
+        }
+
         if(needs_render){
             render(renderer, text_texture, font, font_bold, (uint32_t)char_h, (uint32_t)char_w);
         }
@@ -1622,7 +1983,16 @@ int main(void) {
         waitpid(child_pid, NULL, WNOHANG);
     }
     if (master_fd >= 0) close(master_fd);
+    if (screens[BUFFER_MAIN].cells && screens[BUFFER_MAIN].cells != term_buffer) {
+        free(screens[BUFFER_MAIN].cells);
+        if (screens[BUFFER_MAIN].row_wrapped) free(screens[BUFFER_MAIN].row_wrapped);
+    }
+    if (screens[BUFFER_ALT].cells && screens[BUFFER_ALT].cells != term_buffer) {
+        free(screens[BUFFER_ALT].cells);
+        if (screens[BUFFER_ALT].row_wrapped) free(screens[BUFFER_ALT].row_wrapped);
+    }
     free(term_buffer);
+    if (row_wrapped) free(row_wrapped);
     clear_scrollback();
     if (text_texture) SDL_DestroyTexture(text_texture);
     clear_glyph_cache();
